@@ -109,8 +109,9 @@ async function handleChatCompletion(json, req, res) {
     let usageData = null;
 
     // Client disconnect → kill child process to save tokens
+    // Note: req 'close' fires on normal completion too, so check proc.exitCode
     req.on('close', () => {
-      if (!proc.killed) {
+      if (proc.exitCode === null && !proc.killed) {
         console.log('[claude] client disconnected, killing process');
         proc.kill('SIGTERM');
       }

@@ -353,7 +353,7 @@ const server = http.createServer(async (req, res) => {
 
       const promptText = typeof lastMsg.content === 'string'
         ? lastMsg.content
-        : lastMsg.content.map((c) => c.text || '').join('');
+        : (lastMsg.content || []).map((c) => c.text || '').join('');
 
       // Serialize requests — prevents notification cross-talk between concurrent turns
       await enqueue(() => new Promise((qResolve, qReject) => {
@@ -386,7 +386,7 @@ const server = http.createServer(async (req, res) => {
             let sentRole = false;    // send role: "assistant" in first chunk
 
             function sendChunk(field, text) {
-              if (!text) return;
+              if (!text || res.writableEnded) return;
               const delta = { [field]: text };
               if (!sentRole) {
                 delta.role = 'assistant';
@@ -413,10 +413,13 @@ const server = http.createServer(async (req, res) => {
 
             // Client disconnect → clean up intervals
             let clientDisconnected = false;
+            let safetyTimeout = null;
             req.on('close', () => {
+              if (res.writableEnded) return; // normal completion, not a disconnect
               clientDisconnected = true;
               clearInterval(interval);
               clearInterval(keepalive);
+              clearTimeout(safetyTimeout);
               console.log('[codex] client disconnected');
             });
 
@@ -478,18 +481,21 @@ const server = http.createServer(async (req, res) => {
                     created: Math.floor(Date.now() / 1000), model,
                     choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
                   };
-                  res.write(`data: ${JSON.stringify(endChunk)}\n\n`);
-                  res.write('data: [DONE]\n\n');
+                  if (!res.writableEnded) {
+                    res.write(`data: ${JSON.stringify(endChunk)}\n\n`);
+                    res.write('data: [DONE]\n\n');
+                  }
                   clearInterval(interval);
                   clearInterval(keepalive);
-                  res.end();
+                  clearTimeout(safetyTimeout);
+                  if (!res.writableEnded) res.end();
                   qResolve();
                   return;
                 }
               }
             }, 50);
 
-            setTimeout(() => {
+            safetyTimeout = setTimeout(() => {
               clearInterval(interval);
               clearInterval(keepalive);
               if (!res.writableEnded) res.end();
