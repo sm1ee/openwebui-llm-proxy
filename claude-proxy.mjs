@@ -34,27 +34,38 @@ function readBody(req) {
 }
 
 function buildPrompt(messages) {
-  // OpenAI messages → 단일 프롬프트 변환
-  return messages
-    .map((m) => {
-      const content = typeof m.content === 'string'
-        ? m.content
-        : (m.content || []).map((c) => c.text || '').join('');
-      if (m.role === 'system') return `[System] ${content}`;
-      if (m.role === 'assistant') return `[Assistant] ${content}`;
-      return content;
-    })
-    .join('\n\n');
+  // system 메시지 분리 — --system-prompt 플래그로 전달
+  const parts = [];
+  for (const m of messages) {
+    if (m.role === 'system') continue; // handled separately
+    const content = typeof m.content === 'string'
+      ? m.content
+      : (m.content || []).map((c) => c.text || '').join('');
+    if (m.role === 'assistant') parts.push(`[Assistant] ${content}`);
+    else parts.push(content);
+  }
+  return parts.join('\n\n');
 }
 
-async function handleChatCompletion(json, res) {
+function extractSystemPrompt(messages) {
+  const sysMsgs = messages
+    .filter((m) => m.role === 'system')
+    .map((m) => typeof m.content === 'string' ? m.content : (m.content || []).map((c) => c.text || '').join(''));
+  return sysMsgs.join('\n\n') || '';
+}
+
+async function handleChatCompletion(json, req, res) {
   const messages = json.messages || [];
   const model = json.model || CLAUDE_MODEL;
   const stream = json.stream || false;
   const prompt = buildPrompt(messages);
+  const systemPrompt = extractSystemPrompt(messages);
   const chatId = `chatcmpl-${randomUUID().slice(0, 8)}`;
 
   const args = ['-p', '--model', model, '--no-session-persistence', '--effort', 'high'];
+  if (systemPrompt) {
+    args.push('--system-prompt', systemPrompt);
+  }
 
   if (stream) {
     args.push('--output-format', 'stream-json', '--verbose');
@@ -95,6 +106,27 @@ async function handleChatCompletion(json, res) {
 
     let sentRole = false;
     let buffer = '';
+    let usageData = null;
+
+    // Client disconnect → kill child process to save tokens
+    req.on('close', () => {
+      if (!proc.killed) {
+        console.log('[claude] client disconnected, killing process');
+        proc.kill('SIGTERM');
+      }
+    });
+
+    function sendChunk(field, text) {
+      if (!text || res.writableEnded) return;
+      const delta = { [field]: text };
+      if (!sentRole) { delta.role = 'assistant'; sentRole = true; }
+      res.write(`data: ${JSON.stringify({
+        id: chatId, object: 'chat.completion.chunk',
+        created: Math.floor(Date.now() / 1000), model,
+        choices: [{ index: 0, delta, finish_reason: null }],
+      })}\n\n`);
+    }
+
     proc.stdout.on('data', (chunk) => {
       buffer += chunk.toString();
       const lines = buffer.split('\n');
@@ -104,42 +136,65 @@ async function handleChatCompletion(json, res) {
         if (!line.trim()) continue;
         try {
           const event = JSON.parse(line);
-          let textDelta = '';
-          let thinkingDelta = '';
 
+          // Claude Code stream-json: {"type": "assistant", "message": {"content": [...]}}
           if (event.type === 'assistant' && event.message?.content) {
             for (const block of event.message.content) {
-              if (block.type === 'thinking') thinkingDelta += block.thinking || '';
-              else if (block.type === 'text') textDelta += block.text || '';
+              if (block.type === 'thinking') {
+                sendChunk('reasoning_content', block.thinking || '');
+              } else if (block.type === 'text') {
+                sendChunk('content', block.text || '');
+              } else if (block.type === 'tool_use') {
+                // Show tool execution to user
+                const inputStr = JSON.stringify(block.input || {});
+                const display = inputStr.length > 200
+                  ? inputStr.slice(0, 200) + '...'
+                  : inputStr;
+                sendChunk('content', `\n\n> **[Tool: ${block.name}]** \`${display}\`\n\n`);
+              }
             }
-          } else if (event.type === 'content_block_delta') {
+          }
+          // Tool result from Claude Code
+          else if (event.type === 'user' && event.message?.content) {
+            for (const block of event.message.content) {
+              if (block.type === 'tool_result') {
+                const output = typeof block.content === 'string'
+                  ? block.content
+                  : JSON.stringify(block.content || '');
+                const truncated = output.length > 500
+                  ? output.slice(0, 500) + '\n... (truncated)'
+                  : output;
+                if (block.is_error) {
+                  sendChunk('content', `\n> **[Error]** \`${truncated}\`\n\n`);
+                } else {
+                  sendChunk('content', `\n> \`\`\`\n${truncated}\n\`\`\`\n\n`);
+                }
+              }
+            }
+          }
+          // Tool use summary (concise alternative if tool_result is verbose)
+          else if (event.type === 'tool_use_summary') {
+            // Already showed tool_result above; log only
+            console.log(`[claude] tool summary: ${event.summary || ''}`);
+          }
+          // Fallback: content_block_delta (Anthropic API format, may appear in future CLI versions)
+          else if (event.type === 'content_block_delta') {
             if (event.delta?.type === 'thinking_delta') {
-              thinkingDelta = event.delta.thinking || '';
-            } else {
-              textDelta = event.delta?.text || '';
+              sendChunk('reasoning_content', event.delta.thinking || '');
+            } else if (event.delta?.type === 'text_delta') {
+              sendChunk('content', event.delta.text || '');
             }
-          } else {
-            continue;
           }
-
-          if (thinkingDelta) {
-            const delta = { reasoning_content: thinkingDelta };
-            if (!sentRole) { delta.role = 'assistant'; sentRole = true; }
-            res.write(`data: ${JSON.stringify({
-              id: chatId, object: 'chat.completion.chunk',
-              created: Math.floor(Date.now() / 1000), model,
-              choices: [{ index: 0, delta, finish_reason: null }],
-            })}\n\n`);
-          }
-
-          if (textDelta) {
-            const delta = { content: textDelta };
-            if (!sentRole) { delta.role = 'assistant'; sentRole = true; }
-            res.write(`data: ${JSON.stringify({
-              id: chatId, object: 'chat.completion.chunk',
-              created: Math.floor(Date.now() / 1000), model,
-              choices: [{ index: 0, delta, finish_reason: null }],
-            })}\n\n`);
+          // Extract usage from result event
+          else if (event.type === 'result') {
+            usageData = {
+              prompt_tokens: event.usage?.input_tokens || 0,
+              completion_tokens: event.usage?.output_tokens || 0,
+              total_tokens: (event.usage?.input_tokens || 0) + (event.usage?.output_tokens || 0),
+            };
+            if (event.total_cost_usd) {
+              console.log(`[claude] cost: $${event.total_cost_usd.toFixed(4)}, tokens: ${usageData.total_tokens}`);
+            }
           }
         } catch { /* ignore non-json lines */ }
       }
@@ -148,11 +203,14 @@ async function handleChatCompletion(json, res) {
     proc.on('close', () => {
       clearInterval(keepalive);
       if (res.writableEnded) return;
-      res.write(`data: ${JSON.stringify({
+      // Send usage in final chunk if available
+      const finalChunk = {
         id: chatId, object: 'chat.completion.chunk',
         created: Math.floor(Date.now() / 1000), model,
         choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
-      })}\n\n`);
+      };
+      if (usageData) finalChunk.usage = usageData;
+      res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
       res.write('data: [DONE]\n\n');
       res.end();
     });
@@ -224,7 +282,7 @@ const server = http.createServer(async (req, res) => {
     if (path === '/v1/chat/completions' && req.method === 'POST') {
       const body = await readBody(req);
       const json = JSON.parse(body);
-      await handleChatCompletion(json, res);
+      await handleChatCompletion(json, req, res);
       return;
     }
 

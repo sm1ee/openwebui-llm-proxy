@@ -411,7 +411,17 @@ const server = http.createServer(async (req, res) => {
               if (!res.writableEnded) res.write(': keepalive\n\n');
             }, 15000);
 
+            // Client disconnect → clean up intervals
+            let clientDisconnected = false;
+            req.on('close', () => {
+              clientDisconnected = true;
+              clearInterval(interval);
+              clearInterval(keepalive);
+              console.log('[codex] client disconnected');
+            });
+
             const interval = setInterval(() => {
+              if (clientDisconnected) return;
               const notifications = codex.notifications;
               for (let i = seenIdx; i < notifications.length; i++) {
                 const msg = notifications[i];
