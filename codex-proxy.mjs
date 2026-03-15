@@ -99,19 +99,19 @@ class CodexClient {
       }
       return;
     }
-    // notification - log all methods for debugging
+    // notification - log significant events only (skip high-frequency deltas)
     if (msg.method && !msg.method.startsWith('$/')) {
-      let extra = msg.params?.item?.type ? ' item.type=' + msg.params.item.type : '';
-      if (msg.method === 'item/agentMessage/delta' && msg.params?.delta) {
-        extra += ` "${String(msg.params.delta).slice(0, 30)}"`;
+      const skip = msg.method === 'item/agentMessage/delta'
+        || msg.method === 'item/reasoning/summaryTextDelta'
+        || msg.method === 'codex/event/reasoning_content_delta'
+        || msg.method === 'codex/event/agent_reasoning_delta';
+      if (!skip) {
+        let extra = msg.params?.item?.type ? ' item.type=' + msg.params.item.type : '';
+        if (msg.method === 'error' || msg.method === 'codex/event/error') {
+          extra += ` ERR=${JSON.stringify(msg.params).slice(0, 300)}`;
+        }
+        console.log(`[codex notification] ${msg.method}${extra}`);
       }
-      if (msg.method === 'item/reasoning/summaryTextDelta') {
-        extra += ` delta=${JSON.stringify(msg.params?.delta).slice(0, 60)}`;
-      }
-      if (msg.method === 'error' || msg.method === 'codex/event/error') {
-        extra += ` ERR=${JSON.stringify(msg.params).slice(0, 300)}`;
-      }
-      console.log(`[codex notification] ${msg.method}${extra}`);
     }
     this.notifications.push(msg);
   }
@@ -286,15 +286,24 @@ async function getOrCreateThread(client, model) {
   if (threadCache.has(model)) {
     return threadCache.get(model);
   }
-  const { thread } = await client.request('thread/start', {
-    model,
-    cwd: CODEX_CWD,
-    approvalPolicy: 'never',
-    sandbox: 'danger-full-access',
-  });
-  threadCache.set(model, thread.id);
-  console.log(`[codex] new thread for ${model}: ${thread.id}`);
-  return thread.id;
+  try {
+    const { thread } = await client.request('thread/start', {
+      model,
+      cwd: CODEX_CWD,
+      approvalPolicy: 'never',
+      sandbox: 'danger-full-access',
+    });
+    threadCache.set(model, thread.id);
+    console.log(`[codex] new thread for ${model}: ${thread.id}`);
+    return thread.id;
+  } catch (err) {
+    threadCache.delete(model);  // invalidate on error
+    throw err;
+  }
+}
+
+function invalidateThread(model) {
+  threadCache.delete(model);
 }
 
 // ── Main ──
@@ -347,7 +356,8 @@ const server = http.createServer(async (req, res) => {
         : lastMsg.content.map((c) => c.text || '').join('');
 
       // Serialize requests — prevents notification cross-talk between concurrent turns
-      await enqueue(() => new Promise(async (qResolve, qReject) => {
+      await enqueue(() => new Promise((qResolve, qReject) => {
+        (async () => {
         try {
           codex.drainNotifications();
 
@@ -368,7 +378,7 @@ const server = http.createServer(async (req, res) => {
             });
 
             const chatId = `chatcmpl-${randomUUID().slice(0, 8)}`;
-            const seen = new Set();
+            let seenIdx = 0;  // track last processed notification index
             const tagFilter = new TagFilter();
             let agentMsgBuffer = [];
             let hadCommand = false;  // true after first commandExecution in this turn
@@ -378,7 +388,7 @@ const server = http.createServer(async (req, res) => {
             function sendChunk(field, text) {
               if (!text) return;
               const delta = { [field]: text };
-              if (!sentRole && field === 'content') {
+              if (!sentRole) {
                 delta.role = 'assistant';
                 sentRole = true;
               }
@@ -396,11 +406,16 @@ const server = http.createServer(async (req, res) => {
               agentMsgBuffer = [];
             }
 
+            // Keepalive: prevent OpenWebUI timeout during long tool executions
+            const keepalive = setInterval(() => {
+              if (!res.writableEnded) res.write(': keepalive\n\n');
+            }, 15000);
+
             const interval = setInterval(() => {
-              for (const msg of codex.notifications) {
-                const key = JSON.stringify(msg);
-                if (seen.has(key)) continue;
-                seen.add(key);
+              const notifications = codex.notifications;
+              for (let i = seenIdx; i < notifications.length; i++) {
+                const msg = notifications[i];
+                seenIdx = i + 1;
 
                 const p = msg.params ?? {};
 
@@ -441,6 +456,10 @@ const server = http.createServer(async (req, res) => {
                   }
                 }
 
+                if (msg.method === 'error' || msg.method === 'codex/event/error') {
+                  invalidateThread(model);
+                }
+
                 if (msg.method === 'turn/completed') {
                   // Flush any remaining buffer as content (final answer)
                   flushBuffer('content');
@@ -452,6 +471,7 @@ const server = http.createServer(async (req, res) => {
                   res.write(`data: ${JSON.stringify(endChunk)}\n\n`);
                   res.write('data: [DONE]\n\n');
                   clearInterval(interval);
+                  clearInterval(keepalive);
                   res.end();
                   qResolve();
                   return;
@@ -461,6 +481,7 @@ const server = http.createServer(async (req, res) => {
 
             setTimeout(() => {
               clearInterval(interval);
+              clearInterval(keepalive);
               if (!res.writableEnded) res.end();
               qResolve();
             }, 600_000);
@@ -484,6 +505,7 @@ const server = http.createServer(async (req, res) => {
         } catch (err) {
           qReject(err);
         }
+        })();
       }));
       return;
     }
@@ -499,8 +521,12 @@ const server = http.createServer(async (req, res) => {
     res.end('Not Found');
   } catch (err) {
     console.error('[error]', err);
-    res.writeHead(500, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: { message: err.message } }));
+    if (!res.headersSent) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+    }
+    if (!res.writableEnded) {
+      res.end(JSON.stringify({ error: { message: err.message } }));
+    }
   }
 });
 
