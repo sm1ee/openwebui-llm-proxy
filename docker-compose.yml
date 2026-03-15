@@ -1,0 +1,63 @@
+version: "3.9"
+
+services:
+  # ── Qdrant Vector Database ──
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: qdrant
+    restart: unless-stopped
+    ports:
+      - "0.0.0.0:6333:6333"   # REST API
+      - "0.0.0.0:6334:6334"   # gRPC
+    volumes:
+      - ./qdrant/data:/qdrant/storage
+    environment:
+      QDRANT__SERVICE__API_KEY: "${QDRANT_API_KEY}"
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/6333'"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ── Tool / Skill API (FastAPI + FastEmbed) ──
+  tool-api:
+    build:
+      context: ./tool-api
+      dockerfile: Dockerfile
+    container_name: tool-api
+    restart: unless-stopped
+    ports:
+      - "0.0.0.0:8100:8000"
+    environment:
+      QDRANT_HOST: qdrant
+      QDRANT_PORT: 6333
+      QDRANT_API_KEY: "${QDRANT_API_KEY}"
+    depends_on:
+      qdrant:
+        condition: service_healthy
+    volumes:
+      - ./tool-api:/app
+      - ./data:/data
+      - fastembed-cache:/root/.cache/fastembed
+
+  # ── OpenWebUI ──
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: open-webui
+    restart: unless-stopped
+    ports:
+      - "0.0.0.0:3000:8080"
+    environment:
+      WEBUI_AUTH: "true"
+      ENABLE_SIGNUP: "false"
+      # Codex proxy (맥 로컬 :8200)
+      OPENAI_API_BASE_URLS: "http://host.docker.internal:8200/v1;http://host.docker.internal:8201/v1"
+      OPENAI_API_KEYS: "dummy-codex;dummy-claude"
+    volumes:
+      - open-webui-data:/app/backend/data
+    depends_on:
+      - tool-api
+
+volumes:
+  open-webui-data:
+  fastembed-cache:

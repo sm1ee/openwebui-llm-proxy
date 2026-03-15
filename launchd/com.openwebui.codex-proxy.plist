@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.openwebui.codex-proxy</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/node</string>
+        <string>/PATH/TO/openwebui-llm-proxy/codex-proxy.mjs</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>CODEX_CWD</key>
+        <string>/PATH/TO/your/workspace</string>
+        <key>CODEX_MODEL</key>
+        <string>gpt-5.4</string>
+        <key>HOME</key>
+        <string>/Users/YOURUSERNAME</string>
+    </dict>
+    <key>WorkingDirectory</key>
+    <string>/PATH/TO/openwebui-llm-proxy</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/codex-proxy.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/codex-proxy.err.log</string>
+</dict>
+</plist>
