@@ -351,9 +351,32 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      const promptText = typeof lastMsg.content === 'string'
-        ? lastMsg.content
-        : (lastMsg.content || []).map((c) => c.text || '').join('');
+      // Build input array — preserve both text and image content parts
+      // OpenWebUI sends Chat Completions format:
+      //   {type: "image_url", image_url: {url: "data:image/png;base64,..."}}
+      // Codex app-server expects:
+      //   text:  {type: "text", text: "..."}
+      //   image: {type: "image", url: "data:image/png;base64,..."}
+      let inputParts;
+      if (typeof lastMsg.content === 'string') {
+        inputParts = [{ type: 'text', text: lastMsg.content }];
+      } else {
+        inputParts = [];
+        for (const c of (lastMsg.content || [])) {
+          if (c.type === 'text') {
+            inputParts.push({ type: 'text', text: c.text || '' });
+          } else if (c.type === 'image_url') {
+            // Convert nested {url: "..."} → flat URL string for Codex
+            const url = c.image_url?.url || (typeof c.image_url === 'string' ? c.image_url : '');
+            if (url) {
+              inputParts.push({ type: 'image', url });
+            }
+          }
+        }
+        if (inputParts.length === 0) {
+          inputParts = [{ type: 'text', text: '' }];
+        }
+      }
 
       // Serialize requests — prevents notification cross-talk between concurrent turns
       await enqueue(() => new Promise((qResolve, qReject) => {
@@ -364,7 +387,7 @@ const server = http.createServer(async (req, res) => {
           const threadId = await getOrCreateThread(codex, model);
           const turnResult = await codex.request('turn/start', {
             threadId,
-            input: [{ type: 'text', text: promptText }],
+            input: inputParts,
             model,
             summary: 'detailed',
           });

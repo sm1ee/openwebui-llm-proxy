@@ -9,6 +9,9 @@
  */
 
 import http from 'node:http';
+import fs from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 
@@ -33,18 +36,59 @@ function readBody(req) {
   });
 }
 
+function saveBase64Image(dataUrl) {
+  // Supports: data:image/png;base64,... , data:image/jpeg;base64,...  etc.
+  const match = dataUrl.match(/^data:image\/([a-zA-Z0-9+.-]+);base64,(.+)$/s);
+  if (!match) return null;
+  const raw = match[1].split('+')[0]; // e.g. "svg+xml" → "svg"
+  const ext = raw === 'jpeg' ? 'jpg' : raw;
+  const tmpPath = path.join(os.tmpdir(), `owui-img-${randomUUID().slice(0, 8)}.${ext}`);
+  try {
+    fs.writeFileSync(tmpPath, Buffer.from(match[2], 'base64'));
+    return tmpPath;
+  } catch (err) {
+    console.error(`[claude] failed to save image: ${err.message}`);
+    return null;
+  }
+}
+
 function buildPrompt(messages) {
   // system 메시지 분리 — --system-prompt 플래그로 전달
   const parts = [];
+  const tempFiles = [];
   for (const m of messages) {
     if (m.role === 'system') continue; // handled separately
-    const content = typeof m.content === 'string'
-      ? m.content
-      : (m.content || []).map((c) => c.text || '').join('');
+    let content;
+    if (typeof m.content === 'string') {
+      content = m.content;
+    } else {
+      const contentParts = [];
+      for (const c of (m.content || [])) {
+        if (c.type === 'text') {
+          contentParts.push(c.text || '');
+        } else if (c.type === 'image_url') {
+          // OpenWebUI sends images as base64 data URLs (after convert_url_images_to_base64)
+          const url = c.image_url?.url || (typeof c.image_url === 'string' ? c.image_url : '');
+          if (url.startsWith('data:')) {
+            const tmpPath = saveBase64Image(url);
+            if (tmpPath) {
+              tempFiles.push(tmpPath);
+              // Claude Code -p mode: Read tool can view image files natively
+              contentParts.push(`\n[User attached an image: ${tmpPath}]\nIMPORTANT: Read the file "${tmpPath}" to view the attached image before responding.`);
+            } else {
+              contentParts.push('[User attached an image but it could not be decoded]');
+            }
+          } else if (url) {
+            contentParts.push(`[User attached an image URL: ${url}]\nPlease fetch and view this image URL before responding.`);
+          }
+        }
+      }
+      content = contentParts.join('\n');
+    }
     if (m.role === 'assistant') parts.push(`[Assistant] ${content}`);
     else parts.push(content);
   }
-  return parts.join('\n\n');
+  return { prompt: parts.join('\n\n'), tempFiles };
 }
 
 function extractSystemPrompt(messages) {
@@ -58,7 +102,22 @@ async function handleChatCompletion(json, req, res) {
   const messages = json.messages || [];
   const model = json.model || CLAUDE_MODEL;
   const stream = json.stream || false;
-  const prompt = buildPrompt(messages);
+
+  // DEBUG: Log incoming message structure to diagnose image passthrough
+  for (const m of messages) {
+    if (m.role === 'system') continue;
+    if (typeof m.content !== 'string') {
+      console.log(`[DEBUG] ${m.role} content (array):`, JSON.stringify((m.content || []).map(c => ({
+        type: c.type,
+        ...(c.type === 'image_url' ? { url_prefix: (c.image_url?.url || '').slice(0, 80) } : {}),
+        ...(c.type === 'text' ? { text: (c.text || '').slice(0, 60) } : {}),
+      }))));
+    } else {
+      console.log(`[DEBUG] ${m.role} content (string): ${m.content.slice(0, 80)}`);
+    }
+  }
+
+  const { prompt, tempFiles } = buildPrompt(messages);
   const systemPrompt = extractSystemPrompt(messages);
   const chatId = `chatcmpl-${randomUUID().slice(0, 8)}`;
 
@@ -68,7 +127,7 @@ async function handleChatCompletion(json, req, res) {
   }
 
   if (stream) {
-    args.push('--output-format', 'stream-json', '--verbose');
+    args.push('--output-format', 'stream-json', '--verbose', '--include-partial-messages');
 
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
@@ -138,21 +197,41 @@ async function handleChatCompletion(json, req, res) {
         try {
           const event = JSON.parse(line);
 
-          // Claude Code stream-json: {"type": "assistant", "message": {"content": [...]}}
+          // Token-level streaming via --include-partial-messages
+          // stream_event wraps Anthropic API events: content_block_delta, etc.
+          if (event.type === 'stream_event') {
+            const ev = event.event || {};
+            if (ev.type === 'content_block_start') {
+              const cb = ev.content_block || {};
+              if (cb.type === 'tool_use' && cb.name) {
+                sendChunk('content', `\n\n> **[Tool: ${cb.name}]** `);
+              }
+            } else if (ev.type === 'content_block_delta') {
+              const delta = ev.delta || {};
+              if (delta.type === 'thinking_delta' && delta.thinking) {
+                sendChunk('reasoning_content', delta.thinking);
+              } else if (delta.type === 'text_delta' && delta.text) {
+                sendChunk('content', delta.text);
+              }
+              // input_json_delta, signature_delta: skip (tool input noise)
+            }
+            // message_start, content_block_stop, message_delta, message_stop: skip
+            continue;
+          }
+
+          // Full assistant message — emitted AFTER stream_events for each turn
+          // Only process tool_use blocks here (thinking/text already sent via deltas)
           if (event.type === 'assistant' && event.message?.content) {
             for (const block of event.message.content) {
-              if (block.type === 'thinking') {
-                sendChunk('reasoning_content', block.thinking || '');
-              } else if (block.type === 'text') {
-                sendChunk('content', block.text || '');
-              } else if (block.type === 'tool_use') {
-                // Show tool execution to user
+              if (block.type === 'tool_use') {
+                // Show tool input (compact)
                 const inputStr = JSON.stringify(block.input || {});
                 const display = inputStr.length > 200
                   ? inputStr.slice(0, 200) + '...'
                   : inputStr;
-                sendChunk('content', `\n\n> **[Tool: ${block.name}]** \`${display}\`\n\n`);
+                sendChunk('content', `\`${display}\`\n\n`);
               }
+              // thinking/text already streamed via stream_event deltas — skip
             }
           }
           // Tool result from Claude Code
@@ -203,6 +282,8 @@ async function handleChatCompletion(json, req, res) {
 
     proc.on('close', () => {
       clearInterval(keepalive);
+      // Clean up temp image files
+      for (const f of tempFiles) { try { fs.unlinkSync(f); } catch {} }
       if (res.writableEnded) return;
       // Send usage in final chunk if available
       const finalChunk = {
@@ -238,6 +319,8 @@ async function handleChatCompletion(json, req, res) {
     proc.stderr.on('data', (d) => { stderr += d.toString(); });
 
     await new Promise((resolve) => proc.on('close', resolve));
+    // Clean up temp image files
+    for (const f of tempFiles) { try { fs.unlinkSync(f); } catch {} }
 
     if (stderr.trim()) {
       console.error(`[claude stderr] ${stderr.trim()}`);
