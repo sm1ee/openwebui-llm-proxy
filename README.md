@@ -4,6 +4,16 @@ OpenAI-compatible proxy that bridges **Codex CLI** and **Claude Code** to **[Ope
 
 Use Codex and Claude Code as if they were OpenAI API endpoints — complete with **reasoning/thinking visualization** in OpenWebUI.
 
+
+## Who is this for?
+
+- This tool is designed for users who rely on plan-based CLI tools instead of API keys:
+  - Users of Codex CLI (Codex Plan)
+  - Users of Claude Code (Claude Plan)
+
+If you are using Codex or Claude through their official CLI tools — rather than paid API usage — this proxy allows you to integrate them seamlessly with OpenWebUI as if they were standard OpenAI-compatible endpoints.
+
+
 ## Features
 
 - **Codex Proxy** — Translates Codex `app-server` JSON-RPC into OpenAI-compatible SSE streams
