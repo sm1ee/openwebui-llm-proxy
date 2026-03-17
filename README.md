@@ -160,6 +160,89 @@ Register `openwebui-tools/security_research_tools.py` in OpenWebUI Admin → Too
 - `search_bugbounty` — Search bug bounty notes
 - `list_projects` — List registered projects with stats
 
+## MCP Access From Codex And Claude
+
+The vector DB can also be used directly from Codex CLI and Claude Code through MCP, without going through OpenWebUI custom tools.
+
+### Codex
+
+Add this to `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.security-vectordb]
+command = "/path/to/tool-api/.venv/bin/python"
+args = ["/path/to/tool-api/mcp_server.py"]
+
+[mcp_servers.security-vectordb.env]
+QDRANT_HOST = "localhost"
+QDRANT_PORT = "6333"
+QDRANT_API_KEY = "your-qdrant-api-key"
+```
+
+### Claude
+
+Add this to `~/.claude.json` under `mcpServers`:
+
+```json
+{
+  "security-vectordb": {
+    "type": "stdio",
+    "command": "/path/to/tool-api/.venv/bin/python",
+    "args": ["/path/to/tool-api/mcp_server.py"],
+    "env": {
+      "QDRANT_HOST": "localhost",
+      "QDRANT_PORT": "6333",
+      "QDRANT_API_KEY": "your-qdrant-api-key"
+    }
+  }
+}
+```
+
+Restart the Codex/Claude app or start a new session after changing MCP settings.
+
+### MCP Tools
+
+Read tools:
+
+- `list_projects`
+- `search_vuln`
+- `search_code`
+- `search_exploit`
+- `search_bugbounty`
+
+Write tools:
+
+- `ingest_document`
+- `ingest_batch`
+
+`ingest_*` automatically creates `{project}_{type}` collections if they do not already exist.
+
+### Example Prompts
+
+Search:
+
+```text
+Use security-vectordb to search_code in project n8n for "webhook auth bypass" and summarize the most relevant hits.
+```
+
+Single ingest:
+
+```text
+Use security-vectordb ingest_document with:
+project=n8n
+type=bugbounty
+text="Stored XSS in workflow name leads to admin session theft."
+metadata={"program":"n8n","severity":"high","status":"triage","source":"manual-note"}
+```
+
+Batch ingest:
+
+```text
+Use security-vectordb ingest_batch to store these notes in project jira type vuln:
+1. text="Auth bypass candidate in legacy servlet filter", metadata={"severity":"high","source":"audit"}
+2. text="Potential path traversal in attachment export flow", metadata={"severity":"medium","source":"audit"}
+```
+
 ## Nginx + Geo-filtering
 
 Optional reverse proxy with Korean-only IP restriction:

@@ -13,6 +13,8 @@ import os
 import sys
 import json
 import argparse
+import re
+import uuid
 from typing import Optional
 
 from mcp.server import Server
@@ -23,17 +25,40 @@ from mcp.server.stdio import stdio_server
 from fastembed import TextEmbedding
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
+    Distance,
     Filter,
     FieldCondition,
     MatchValue,
+    PayloadSchemaType,
+    PointStruct,
     ScoredPoint,
+    VectorParams,
 )
 
 QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
 QDRANT_PORT = os.getenv("QDRANT_PORT", "6333")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY", "")
 EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
+EMBEDDING_DIM = 384
 VALID_TYPES = ("vuln", "code", "exploit", "bugbounty")
+COLLECTION_TYPES = {
+    "vuln": {
+        "description": "취약점 분석, CVE, advisory, patch diff",
+        "indexes": ["cve_id", "severity", "type", "source"],
+    },
+    "code": {
+        "description": "소스코드 chunk 임베딩 (함수/클래스 단위)",
+        "indexes": ["file", "language", "function_name"],
+    },
+    "exploit": {
+        "description": "exploit 코드, PoC, payload",
+        "indexes": ["target", "type", "cve_id", "platform"],
+    },
+    "bugbounty": {
+        "description": "버그바운티 노트, 리포트, writeup",
+        "indexes": ["program", "severity", "status", "type"],
+    },
+}
 
 qdrant = QdrantClient(
     url=f"http://{QDRANT_HOST}:{QDRANT_PORT}",
@@ -44,6 +69,10 @@ embedder = TextEmbedding(model_name=EMBEDDING_MODEL)
 
 def get_embedding(text: str) -> list[float]:
     return list(next(embedder.embed([text])))
+
+
+def get_embeddings(texts: list[str]) -> list[list[float]]:
+    return [list(v) for v in embedder.embed(texts)]
 
 
 def scored_to_dict(p: ScoredPoint) -> dict:
@@ -62,6 +91,39 @@ def get_projects() -> dict[str, list[str]]:
         if len(parts) == 2 and parts[1] in VALID_TYPES:
             projects.setdefault(parts[0], []).append(parts[1])
     return projects
+
+
+def validate_project_name(project: str) -> None:
+    if not re.match(r"^[a-z0-9][a-z0-9_-]*$", project):
+        raise ValueError(f"invalid project name: {project}")
+
+
+def ensure_collection(project: str, ctype: str) -> str:
+    validate_project_name(project)
+    if ctype not in VALID_TYPES:
+        raise ValueError(f"invalid type: {ctype}")
+
+    cname = f"{project}_{ctype}"
+    existing = {c.name for c in qdrant.get_collections().collections}
+    if cname in existing:
+        return cname
+
+    qdrant.create_collection(
+        collection_name=cname,
+        vectors_config=VectorParams(
+            size=EMBEDDING_DIM,
+            distance=Distance.COSINE,
+        ),
+    )
+
+    for field in COLLECTION_TYPES[ctype]["indexes"]:
+        qdrant.create_payload_index(
+            collection_name=cname,
+            field_name=field,
+            field_schema=PayloadSchemaType.KEYWORD,
+        )
+
+    return cname
 
 
 def do_search(project: str, ctype: str, query: str, limit: int = 5, filters: dict | None = None) -> list[dict]:
@@ -158,6 +220,44 @@ async def list_tools():
                 },
             },
         ),
+        Tool(
+            name="ingest_document",
+            description="단일 문서를 벡터DB에 저장합니다. 컬렉션이 없으면 자동 생성합니다.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "프로젝트명"},
+                    "type": {"type": "string", "description": "vuln | code | exploit | bugbounty", "enum": list(VALID_TYPES)},
+                    "text": {"type": "string", "description": "임베딩할 본문 텍스트"},
+                    "metadata": {"type": "object", "description": "저장할 payload 메타데이터", "default": {}},
+                },
+                "required": ["project", "type", "text"],
+            },
+        ),
+        Tool(
+            name="ingest_batch",
+            description="여러 문서를 배치로 벡터DB에 저장합니다. 컬렉션이 없으면 자동 생성합니다.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "프로젝트명"},
+                    "type": {"type": "string", "description": "vuln | code | exploit | bugbounty", "enum": list(VALID_TYPES)},
+                    "items": {
+                        "type": "array",
+                        "description": "[{\"text\":\"...\", \"metadata\": {...}}, ...]",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "text": {"type": "string"},
+                                "metadata": {"type": "object", "default": {}},
+                            },
+                            "required": ["text"],
+                        },
+                    },
+                },
+                "required": ["project", "type", "items"],
+            },
+        ),
     ]
 
 
@@ -216,6 +316,53 @@ async def call_tool(name: str, arguments: dict):
                 for t in types:
                     info = qdrant.get_collection(f"{proj}_{t}")
                     result[proj][t] = info.points_count
+            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+
+        elif name == "ingest_document":
+            project = arguments["project"]
+            ctype = arguments["type"]
+            text = arguments["text"]
+            metadata = arguments.get("metadata") or {}
+
+            cname = ensure_collection(project, ctype)
+            point_id = str(uuid.uuid4())
+            payload = {**metadata, "text": text}
+            qdrant.upsert(
+                collection_name=cname,
+                points=[PointStruct(id=point_id, vector=get_embedding(text), payload=payload)],
+            )
+            result = {
+                "status": "ingested",
+                "collection": cname,
+                "id": point_id,
+            }
+            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+
+        elif name == "ingest_batch":
+            project = arguments["project"]
+            ctype = arguments["type"]
+            items = arguments["items"]
+            if not items:
+                raise ValueError("items must not be empty")
+
+            cname = ensure_collection(project, ctype)
+            texts = [item["text"] for item in items]
+            vectors = get_embeddings(texts)
+            points = []
+            ids = []
+            for idx, item in enumerate(items):
+                point_id = str(uuid.uuid4())
+                ids.append(point_id)
+                payload = {**(item.get("metadata") or {}), "text": item["text"]}
+                points.append(PointStruct(id=point_id, vector=vectors[idx], payload=payload))
+
+            qdrant.upsert(collection_name=cname, points=points)
+            result = {
+                "status": "ingested",
+                "collection": cname,
+                "count": len(points),
+                "ids": ids,
+            }
             return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 
         else:
