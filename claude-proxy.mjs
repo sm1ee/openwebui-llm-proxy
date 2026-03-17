@@ -14,10 +14,31 @@ import path from 'node:path';
 import os from 'node:os';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const CONFIG_PATH = path.join(__dirname, 'config.json');
 
 const PORT = parseInt(process.env.CLAUDE_PROXY_PORT || '8201');
 const CLAUDE_BIN = process.env.CLAUDE_BIN || 'claude';
 const CLAUDE_MODEL = process.env.CLAUDE_MODEL || 'sonnet';
+
+// ── Config ──
+function loadConfig() {
+  try {
+    return JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+  } catch {
+    return { claude: { thinking: true, toolDisplay: true, debugLog: false, effort: 'high' } };
+  }
+}
+
+function saveConfig(cfg) {
+  fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2) + '\n');
+}
+
+function getClaudeConfig() {
+  return loadConfig().claude || {};
+}
 
 const MODELS = [
   { id: 'claude-opus-4-6', name: 'Claude Opus 4.6' },
@@ -103,17 +124,20 @@ async function handleChatCompletion(json, req, res) {
   const model = json.model || CLAUDE_MODEL;
   const stream = json.stream || false;
 
-  // DEBUG: Log incoming message structure to diagnose image passthrough
-  for (const m of messages) {
-    if (m.role === 'system') continue;
-    if (typeof m.content !== 'string') {
-      console.log(`[DEBUG] ${m.role} content (array):`, JSON.stringify((m.content || []).map(c => ({
-        type: c.type,
-        ...(c.type === 'image_url' ? { url_prefix: (c.image_url?.url || '').slice(0, 80) } : {}),
-        ...(c.type === 'text' ? { text: (c.text || '').slice(0, 60) } : {}),
-      }))));
-    } else {
-      console.log(`[DEBUG] ${m.role} content (string): ${m.content.slice(0, 80)}`);
+  const cfg = getClaudeConfig();
+
+  if (cfg.debugLog) {
+    for (const m of messages) {
+      if (m.role === 'system') continue;
+      if (typeof m.content !== 'string') {
+        console.log(`[DEBUG] ${m.role} content (array):`, JSON.stringify((m.content || []).map(c => ({
+          type: c.type,
+          ...(c.type === 'image_url' ? { url_prefix: (c.image_url?.url || '').slice(0, 80) } : {}),
+          ...(c.type === 'text' ? { text: (c.text || '').slice(0, 60) } : {}),
+        }))));
+      } else {
+        console.log(`[DEBUG] ${m.role} content (string): ${m.content.slice(0, 80)}`);
+      }
     }
   }
 
@@ -121,7 +145,8 @@ async function handleChatCompletion(json, req, res) {
   const systemPrompt = extractSystemPrompt(messages);
   const chatId = `chatcmpl-${randomUUID().slice(0, 8)}`;
 
-  const args = ['-p', '--model', model, '--no-session-persistence', '--effort', 'high'];
+  const effort = cfg.effort || 'high';
+  const args = ['-p', '--model', model, '--no-session-persistence', '--effort', effort];
   if (systemPrompt) {
     args.push('--system-prompt', systemPrompt);
   }
@@ -166,6 +191,8 @@ async function handleChatCompletion(json, req, res) {
     let sentRole = false;
     let buffer = '';
     let usageData = null;
+    let sawReasoningDelta = false;
+    let sawTextDelta = false;
 
     // Client disconnect → kill child process to save tokens
     // Note: req 'close' fires on normal completion too, so check proc.exitCode
@@ -203,14 +230,16 @@ async function handleChatCompletion(json, req, res) {
             const ev = event.event || {};
             if (ev.type === 'content_block_start') {
               const cb = ev.content_block || {};
-              if (cb.type === 'tool_use' && cb.name) {
+              if (cb.type === 'tool_use' && cb.name && cfg.toolDisplay) {
                 sendChunk('content', `\n\n> **[Tool: ${cb.name}]** `);
               }
             } else if (ev.type === 'content_block_delta') {
               const delta = ev.delta || {};
               if (delta.type === 'thinking_delta' && delta.thinking) {
-                sendChunk('reasoning_content', delta.thinking);
+                sawReasoningDelta = true;
+                if (cfg.thinking) sendChunk('reasoning_content', delta.thinking);
               } else if (delta.type === 'text_delta' && delta.text) {
+                sawTextDelta = true;
                 sendChunk('content', delta.text);
               }
               // input_json_delta, signature_delta: skip (tool input noise)
@@ -219,23 +248,36 @@ async function handleChatCompletion(json, req, res) {
             continue;
           }
 
-          // Full assistant message — emitted AFTER stream_events for each turn
-          // Only process tool_use blocks here (thinking/text already sent via deltas)
+          // Full assistant message — emitted AFTER stream_events for each turn.
+          // Some Claude CLI turns omit text/thinking deltas and only include the
+          // final assistant message, so keep a fallback here for those cases.
           if (event.type === 'assistant' && event.message?.content) {
             for (const block of event.message.content) {
               if (block.type === 'tool_use') {
-                // Show tool input (compact)
-                const inputStr = JSON.stringify(block.input || {});
-                const display = inputStr.length > 200
-                  ? inputStr.slice(0, 200) + '...'
-                  : inputStr;
-                sendChunk('content', `\`${display}\`\n\n`);
+                if (cfg.toolDisplay) {
+                  const inputStr = JSON.stringify(block.input || {});
+                  const display = inputStr.length > 200
+                    ? inputStr.slice(0, 200) + '...'
+                    : inputStr;
+                  sendChunk('content', `\`${display}\`\n\n`);
+                }
+              } else if ((block.type === 'thinking' || block.type === 'reasoning' || block.type === 'reasoning_content') && !sawReasoningDelta) {
+                const thinkingText = block.thinking || block.text || '';
+                if (thinkingText && cfg.thinking) {
+                  sawReasoningDelta = true;
+                  sendChunk('reasoning_content', thinkingText);
+                }
+              } else if ((block.type === 'text' || block.type === 'output_text') && !sawTextDelta) {
+                const text = block.text || '';
+                if (text) {
+                  sawTextDelta = true;
+                  sendChunk('content', text);
+                }
               }
-              // thinking/text already streamed via stream_event deltas — skip
             }
           }
           // Tool result from Claude Code
-          else if (event.type === 'user' && event.message?.content) {
+          else if (event.type === 'user' && event.message?.content && cfg.toolDisplay) {
             for (const block of event.message.content) {
               if (block.type === 'tool_result') {
                 const output = typeof block.content === 'string'
@@ -260,8 +302,10 @@ async function handleChatCompletion(json, req, res) {
           // Fallback: content_block_delta (Anthropic API format, may appear in future CLI versions)
           else if (event.type === 'content_block_delta') {
             if (event.delta?.type === 'thinking_delta') {
-              sendChunk('reasoning_content', event.delta.thinking || '');
+              sawReasoningDelta = true;
+              if (cfg.thinking) sendChunk('reasoning_content', event.delta.thinking || '');
             } else if (event.delta?.type === 'text_delta') {
+              sawTextDelta = true;
               sendChunk('content', event.delta.text || '');
             }
           }
@@ -367,6 +411,29 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req);
       const json = JSON.parse(body);
       await handleChatCompletion(json, req, res);
+      return;
+    }
+
+    if (path === '/config' && req.method === 'GET') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(loadConfig()));
+      return;
+    }
+
+    if (path === '/config' && req.method === 'POST') {
+      const body = await readBody(req);
+      const patch = JSON.parse(body);
+      const current = loadConfig();
+      // partial merge: only update provided keys
+      for (const section of ['claude', 'codex']) {
+        if (patch[section]) {
+          current[section] = { ...(current[section] || {}), ...patch[section] };
+        }
+      }
+      saveConfig(current);
+      console.log('[config] updated:', JSON.stringify(current));
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(current));
       return;
     }
 

@@ -5,6 +5,7 @@
   "scripts": {
     "codex": "node codex-proxy.mjs",
     "claude": "node claude-proxy.mjs",
-    "all": "node codex-proxy.mjs & node claude-proxy.mjs & wait"
+    "all": "node codex-proxy.mjs & node claude-proxy.mjs & wait",
+    "config": "node configure.mjs"
   }
 }

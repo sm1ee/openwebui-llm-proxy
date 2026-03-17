@@ -9,9 +9,32 @@
  */
 
 import http from 'node:http';
+import fs from 'node:fs';
+import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { randomUUID } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const CONFIG_PATH = path.join(__dirname, 'config.json');
+
+// ── Config ──
+function loadConfig() {
+  try {
+    return JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+  } catch {
+    return { codex: { reasoning: true, toolDisplay: true, summary: 'detailed' } };
+  }
+}
+
+function saveConfig(cfg) {
+  fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2) + '\n');
+}
+
+function getCodexConfig() {
+  return loadConfig().codex || {};
+}
 
 const PORT = parseInt(process.env.CODEX_PROXY_PORT || '8200');
 const CODEX_BIN = process.env.CODEX_BIN || 'codex';
@@ -383,13 +406,14 @@ const server = http.createServer(async (req, res) => {
         (async () => {
         try {
           codex.drainNotifications();
+          const cfg = getCodexConfig();
 
           const threadId = await getOrCreateThread(codex, model);
           const turnResult = await codex.request('turn/start', {
             threadId,
             input: inputParts,
             model,
-            summary: 'detailed',
+            summary: cfg.summary || 'detailed',
           });
           const turnId = turnResult.turn?.id;
 
@@ -465,15 +489,18 @@ const server = http.createServer(async (req, res) => {
 
                 if (msg.method === 'item/started' && p.item?.type === 'commandExecution') {
                   // Previous agentMessage was thinking — flush as reasoning
-                  flushBuffer('reasoning_content');
+                  if (cfg.reasoning) flushBuffer('reasoning_content');
+                  else agentMsgBuffer = [];
                   hadCommand = true;
                 }
 
                 if (msg.method === 'item/reasoning/delta' || msg.method === 'item/reasoning/summaryTextDelta') {
-                  let reasoning = typeof p.delta === 'string' ? p.delta
-                    : typeof p.delta?.text === 'string' ? p.delta.text : '';
-                  reasoning = stripArtifactTags(reasoning);
-                  if (reasoning) sendChunk('reasoning_content', reasoning);
+                  if (cfg.reasoning) {
+                    let reasoning = typeof p.delta === 'string' ? p.delta
+                      : typeof p.delta?.text === 'string' ? p.delta.text : '';
+                    reasoning = stripArtifactTags(reasoning);
+                    if (reasoning) sendChunk('reasoning_content', reasoning);
+                  }
                 }
 
                 if (msg.method === 'item/agentMessage/delta') {
@@ -546,6 +573,29 @@ const server = http.createServer(async (req, res) => {
         }
         })();
       }));
+      return;
+    }
+
+    // Config
+    if (path === '/config' && req.method === 'GET') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(loadConfig()));
+      return;
+    }
+
+    if (path === '/config' && req.method === 'POST') {
+      const body = await readBody(req);
+      const patch = JSON.parse(body);
+      const current = loadConfig();
+      for (const section of ['claude', 'codex']) {
+        if (patch[section]) {
+          current[section] = { ...(current[section] || {}), ...patch[section] };
+        }
+      }
+      saveConfig(current);
+      console.log('[config] updated:', JSON.stringify(current));
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(current));
       return;
     }
 
