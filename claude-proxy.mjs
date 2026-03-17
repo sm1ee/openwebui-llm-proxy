@@ -24,11 +24,32 @@ const CLAUDE_BIN = process.env.CLAUDE_BIN || 'claude';
 const CLAUDE_MODEL = process.env.CLAUDE_MODEL || 'sonnet';
 
 // ── Config ──
+const DEFAULT_CONFIG = {
+  claude: {
+    thinking: true,
+    toolDisplay: true,
+    debugLog: false,
+    effort: 'high',
+  },
+};
+
+function deepMerge(base, patch) {
+  const output = { ...base };
+  for (const [key, value] of Object.entries(patch || {})) {
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+      output[key] = deepMerge(base[key] || {}, value);
+    } else {
+      output[key] = value;
+    }
+  }
+  return output;
+}
+
 function loadConfig() {
   try {
-    return JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+    return deepMerge(DEFAULT_CONFIG, JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')));
   } catch {
-    return { claude: { thinking: true, toolDisplay: true, debugLog: false, effort: 'high' } };
+    return structuredClone(DEFAULT_CONFIG);
   }
 }
 
@@ -193,10 +214,14 @@ async function handleChatCompletion(json, req, res) {
     let usageData = null;
     let sawReasoningDelta = false;
     let sawTextDelta = false;
+    let stderrBuffer = '';
+    let sentVisibleContent = false;
+    let clientDisconnected = false;
 
     // Client disconnect → kill child process to save tokens
     // Note: req 'close' fires on normal completion too, so check proc.exitCode
     req.on('close', () => {
+      clientDisconnected = true;
       if (proc.exitCode === null && !proc.killed) {
         console.log('[claude] client disconnected, killing process');
         proc.kill('SIGTERM');
@@ -205,6 +230,7 @@ async function handleChatCompletion(json, req, res) {
 
     function sendChunk(field, text) {
       if (!text || res.writableEnded) return;
+      sentVisibleContent = true;
       const delta = { [field]: text };
       if (!sentRole) { delta.role = 'assistant'; sentRole = true; }
       res.write(`data: ${JSON.stringify({
@@ -324,12 +350,17 @@ async function handleChatCompletion(json, req, res) {
       }
     });
 
-    proc.on('close', () => {
+    proc.on('close', (code, signal) => {
       clearInterval(keepalive);
-      // Clean up temp image files
       for (const f of tempFiles) { try { fs.unlinkSync(f); } catch {} }
       if (res.writableEnded) return;
-      // Send usage in final chunk if available
+
+      const stderrMessage = stderrBuffer.trim();
+      if (!clientDisconnected && code !== 0 && !sentVisibleContent) {
+        const message = stderrMessage || `Claude exited with code ${code}${signal ? ` (${signal})` : ''}`;
+        sendChunk('content', `Error: ${message}`);
+      }
+
       const finalChunk = {
         id: chatId, object: 'chat.completion.chunk',
         created: Math.floor(Date.now() / 1000), model,
@@ -342,7 +373,9 @@ async function handleChatCompletion(json, req, res) {
     });
 
     proc.stderr.on('data', (d) => {
-      console.error(`[claude stderr] ${d.toString().trim()}`);
+      const text = d.toString();
+      stderrBuffer += text;
+      console.error(`[claude stderr] ${text.trim()}`);
     });
 
   } else {
@@ -362,12 +395,15 @@ async function handleChatCompletion(json, req, res) {
     proc.stdout.on('data', (d) => { stdout += d.toString(); });
     proc.stderr.on('data', (d) => { stderr += d.toString(); });
 
-    await new Promise((resolve) => proc.on('close', resolve));
-    // Clean up temp image files
+    const exitCode = await new Promise((resolve) => proc.on('close', resolve));
     for (const f of tempFiles) { try { fs.unlinkSync(f); } catch {} }
 
     if (stderr.trim()) {
       console.error(`[claude stderr] ${stderr.trim()}`);
+    }
+
+    if (exitCode !== 0) {
+      throw new Error(stderr.trim() || `Claude exited with code ${exitCode}`);
     }
 
     const response = {

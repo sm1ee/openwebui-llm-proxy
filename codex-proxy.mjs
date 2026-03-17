@@ -20,11 +20,31 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CONFIG_PATH = path.join(__dirname, 'config.json');
 
 // ── Config ──
+const DEFAULT_CONFIG = {
+  codex: {
+    reasoning: true,
+    toolDisplay: true,
+    summary: 'detailed',
+  },
+};
+
+function deepMerge(base, patch) {
+  const output = { ...base };
+  for (const [key, value] of Object.entries(patch || {})) {
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+      output[key] = deepMerge(base[key] || {}, value);
+    } else {
+      output[key] = value;
+    }
+  }
+  return output;
+}
+
 function loadConfig() {
   try {
-    return JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+    return deepMerge(DEFAULT_CONFIG, JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')));
   } catch {
-    return { codex: { reasoning: true, toolDisplay: true, summary: 'detailed' } };
+    return structuredClone(DEFAULT_CONFIG);
   }
 }
 
@@ -51,9 +71,12 @@ class CodexClient {
     this.rl = null;
     this.ready = false;
     this.modelList = [];
+    this.restartPromise = null;
   }
 
   async start() {
+    if (this.ready && this.proc && this.proc.exitCode === null) return;
+
     this.proc = spawn(CODEX_BIN, ['app-server'], {
       stdio: ['pipe', 'pipe', 'inherit'],
       cwd: CODEX_CWD,
@@ -63,6 +86,8 @@ class CodexClient {
     this.proc.on('exit', (code, signal) => {
       console.error(`[codex] exited: ${signal || code}`);
       this.ready = false;
+      this.proc = null;
+      this.rl = null;
       for (const { reject } of this.pending.values()) {
         reject(new Error('codex exited'));
       }
@@ -88,7 +113,39 @@ class CodexClient {
     console.log(`[codex] ready. ${this.modelList.length} models available.`);
   }
 
+  async ensureReady() {
+    if (this.ready && this.proc && this.proc.exitCode === null) return;
+    await this.restart();
+  }
+
+  async restart() {
+    if (this.restartPromise) return this.restartPromise;
+
+    this.restartPromise = (async () => {
+      console.log('[codex] restarting app-server');
+      this.ready = false;
+
+      if (this.rl) {
+        try { this.rl.close(); } catch {}
+        this.rl = null;
+      }
+
+      if (this.proc && this.proc.exitCode === null && !this.proc.killed) {
+        try { this.proc.kill('SIGTERM'); } catch {}
+      }
+      this.proc = null;
+      await this.start();
+    })().finally(() => {
+      this.restartPromise = null;
+    });
+
+    return this.restartPromise;
+  }
+
   request(method, params = {}) {
+    if (!this.proc || !this.proc.stdin || this.proc.stdin.destroyed) {
+      return Promise.reject(new Error('codex is not ready'));
+    }
     const id = this.nextId++;
     const msg = { method, id, params };
     this.proc.stdin.write(`${JSON.stringify(msg)}\n`);
@@ -144,6 +201,119 @@ class CodexClient {
     this.notifications = [];
     return n;
   }
+}
+
+function extractMessageText(content, includeImagePlaceholders = false) {
+  if (typeof content === 'string') return content;
+
+  const parts = [];
+  for (const item of (content || [])) {
+    if (item.type === 'text') {
+      parts.push(item.text || '');
+    } else if (item.type === 'image_url' && includeImagePlaceholders) {
+      parts.push('[User attached an image]');
+    }
+  }
+  return parts.join('\n').trim();
+}
+
+function extractSystemPrompt(messages) {
+  return messages
+    .filter((m) => m.role === 'system')
+    .map((m) => extractMessageText(m.content, false))
+    .filter(Boolean)
+    .join('\n\n');
+}
+
+function buildCodexInput(messages) {
+  let lastUserIndex = -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i]?.role === 'user') {
+      lastUserIndex = i;
+      break;
+    }
+  }
+
+  if (lastUserIndex === -1) return null;
+
+  const history = [];
+  for (let i = 0; i < lastUserIndex; i++) {
+    const message = messages[i];
+    if (!message || message.role === 'system') continue;
+    const text = extractMessageText(message.content, true);
+    if (!text) continue;
+    const label = message.role === 'assistant' ? 'Assistant' : 'User';
+    history.push(`[${label}]\n${text}`);
+  }
+
+  const lastUser = messages[lastUserIndex];
+  const inputParts = [];
+
+  if (history.length > 0) {
+    inputParts.push({
+      type: 'text',
+      text: `Conversation so far:\n\n${history.join('\n\n')}\n\nRespond to the latest user message below.`,
+    });
+  }
+
+  if (typeof lastUser.content === 'string') {
+    inputParts.push({ type: 'text', text: lastUser.content });
+  } else {
+    for (const item of (lastUser.content || [])) {
+      if (item.type === 'text') {
+        inputParts.push({ type: 'text', text: item.text || '' });
+      } else if (item.type === 'image_url') {
+        const url = item.image_url?.url || (typeof item.image_url === 'string' ? item.image_url : '');
+        if (url) inputParts.push({ type: 'image', url });
+      }
+    }
+  }
+
+  if (inputParts.length === 0) {
+    inputParts.push({ type: 'text', text: '' });
+  }
+
+  return {
+    inputParts,
+    systemPrompt: extractSystemPrompt(messages),
+  };
+}
+
+function decodeQuotedString(text) {
+  const value = text.trim();
+  if (
+    (value.startsWith('"') && value.endsWith('"'))
+    || (value.startsWith('\'') && value.endsWith('\''))
+  ) {
+    return value
+      .slice(1, -1)
+      .replace(/\\\\/g, '\\')
+      .replace(/\\n/g, '\n')
+      .replace(/\\t/g, '\t')
+      .replace(/\\"/g, '"')
+      .replace(/\\'/g, '\'');
+  }
+  return null;
+}
+
+function extractToolBodyText(body) {
+  const lines = body
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  if (lines.length === 0) return '';
+
+  const extracted = [];
+  for (const line of lines) {
+    const match = line.match(/^(?:print|console\.log)\(\s*(['"].*['"])\s*\)\s*;?$/);
+    if (!match) return '';
+    const decoded = decodeQuotedString(match[1]);
+    if (decoded === null) return '';
+    extracted.push(decoded);
+  }
+
+  return extracted.join('\n');
 }
 
 // ── Codex XML tag stripping (streaming state machine) ──
@@ -211,14 +381,7 @@ class TagFilter {
     const body = this.toolBodyParts.join('').trim();
     this.toolBodyParts = [];
     if (!body) return '';
-    // Extract string arguments from print() calls
-    const printMatch = body.match(/^print\s*\(\s*(['"])([\s\S]*?)\1\s*\)$/);
-    if (printMatch) return printMatch[2];
-    // Multiple print statements or f-strings — extract all string literals
-    const prints = [...body.matchAll(/print\s*\(\s*(?:f?['"])([\s\S]*?)(?:['"]\s*)\)/g)];
-    if (prints.length > 0) return prints.map(m => m[1]).join('\n');
-    // Not a simple print — return the body as-is (could be useful code)
-    return body;
+    return extractToolBodyText(body);
   }
 }
 
@@ -226,8 +389,7 @@ class TagFilter {
 function stripArtifactTags(text) {
   return text
     .replace(/<(?:code_interpreter|code|file|exec|shell|apply_diff|read_file|write_file|run_command)[^>]*>([\s\S]*?)<\/[^>]+>/gi, (_, body) => {
-      const printMatch = body.trim().match(/^print\s*\(\s*(['"])([\s\S]*?)\1\s*\)$/);
-      return printMatch ? printMatch[2] : body.trim();
+      return extractToolBodyText(body);
     })
     .replace(/<\/?(?:code_interpreter|code|file|exec|shell|apply_diff|read_file|write_file|run_command)[^>]*>/gi, '')
     .replace(/<\/?>/g, '');
@@ -244,32 +406,136 @@ function extractText(notifications) {
       else if (typeof p.text === 'string') parts.push(p.text);
     } else if (msg.method === 'item/completed') {
       const item = p.item ?? {};
-      if (item.type === 'agent_message' && Array.isArray(item.content)) {
-        for (const c of item.content) {
-          if (c?.type === 'output_text' && typeof c.text === 'string') {
-            parts.push(c.text);
-          }
-        }
+      if (item.type === 'agentMessage' && typeof item.text === 'string') {
+        parts.push(item.text);
       }
     }
   }
   return stripArtifactTags(parts.join(''));
 }
 
-// ── Wait for notification ──
-function waitForNotification(client, method, predicate, timeoutMs = 600_000) {
+function extractCompletedAgentText(notifications) {
+  const parts = [];
+  for (const msg of notifications) {
+    const item = msg.params?.item;
+    if (msg.method !== 'item/completed' || item?.type !== 'agentMessage') continue;
+    const cleaned = stripArtifactTags(item.text || '').trim();
+    if (cleaned) parts.push(cleaned);
+  }
+  return parts.join('\n\n').trim();
+}
+
+function notificationTurnId(msg) {
+  return msg.params?.turnId || msg.params?.turn?.id || null;
+}
+
+function notificationMatchesTurn(msg, turnId) {
+  return notificationTurnId(msg) === turnId;
+}
+
+function truncateDisplayText(text, maxChars = 1200, maxLines = 40) {
+  const normalized = String(text || '').trim();
+  if (!normalized) return '';
+
+  const lines = normalized.split('\n');
+  const joined = lines.slice(0, maxLines).join('\n');
+  const truncated = joined.length > maxChars
+    ? `${joined.slice(0, maxChars)}\n... (truncated)`
+    : joined;
+
+  return lines.length > maxLines ? `${truncated}\n... (truncated)` : truncated;
+}
+
+function formatToolBlock(title, body = '') {
+  const safeBody = truncateDisplayText(body).replace(/~~~/g, '~~\\~');
+  if (!safeBody) return `\n\n> **[${title}]**\n\n`;
+  return `\n\n> **[${title}]**\n\n~~~text\n${safeBody}\n~~~\n\n`;
+}
+
+function summarizeMcpResult(result) {
+  if (!result) return '';
+  if (typeof result === 'string') return result;
+
+  if (Array.isArray(result?.content)) {
+    const textBlocks = result.content
+      .filter((block) => block?.type === 'text' && typeof block.text === 'string')
+      .map((block) => block.text);
+    if (textBlocks.length > 0) return textBlocks.join('\n\n');
+  }
+
+  try {
+    return JSON.stringify(result, null, 2);
+  } catch {
+    return String(result);
+  }
+}
+
+function summarizeToolItem(item) {
+  if (!item || typeof item !== 'object') return '';
+
+  if (item.type === 'commandExecution') {
+    const header = typeof item.exitCode === 'number'
+      ? `Command: ${item.command} (exit ${item.exitCode})`
+      : `Command: ${item.command}`;
+    return formatToolBlock(header, item.aggregatedOutput || '');
+  }
+
+  if (item.type === 'fileChange') {
+    const count = Array.isArray(item.changes) ? item.changes.length : 0;
+    return `\n\n> **[Patch]** ${count} file change${count === 1 ? '' : 's'} applied.\n\n`;
+  }
+
+  if (item.type === 'mcpToolCall') {
+    const header = `MCP: ${item.server}/${item.tool}${item.error ? ' (error)' : ''}`;
+    const body = item.error
+      ? JSON.stringify(item.error, null, 2)
+      : summarizeMcpResult(item.result);
+    return formatToolBlock(header, body);
+  }
+
+  if (item.type === 'collabAgentToolCall') {
+    return `\n\n> **[Agent Tool]** ${item.tool}\n\n`;
+  }
+
+  return '';
+}
+
+function maybeScheduleCodexRestart(message) {
+  if (!/401 Unauthorized|Missing bearer or basic authentication/i.test(message || '')) return;
+  setTimeout(() => {
+    codex.restart().catch((err) => {
+      console.error('[codex] restart failed after upstream auth error:', err.message);
+    });
+  }, 0);
+}
+
+// ── Wait for turn completion or terminal error ──
+function waitForTurnOutcome(client, turnId, timeoutMs = 600_000) {
   return new Promise((resolve, reject) => {
     const start = Date.now();
     const interval = setInterval(() => {
-      const found = client.notifications.find(
-        (m) => m.method === method && predicate(m.params)
-      );
-      if (found) {
+      const turnNotifications = client.notifications.filter((msg) => notificationMatchesTurn(msg, turnId));
+      const terminalError = turnNotifications.find((msg) => msg.method === 'error' && msg.params?.willRetry === false);
+      if (terminalError) {
         clearInterval(interval);
-        resolve(found);
-      } else if (Date.now() - start > timeoutMs) {
+        const message = terminalError.params?.error?.message || 'Codex turn failed';
+        maybeScheduleCodexRestart(message);
+        reject(new Error(message));
+        return;
+      }
+
+      const completed = turnNotifications.find((msg) => {
+        return msg.method === 'turn/completed' && msg.params?.turn?.id === turnId;
+      });
+      if (completed) {
         clearInterval(interval);
-        reject(new Error(`timeout waiting for ${method}`));
+        resolve(completed);
+        return;
+      }
+
+      if (Date.now() - start > timeoutMs) {
+        clearInterval(interval);
+        reject(new Error('timeout waiting for turn/completed'));
       }
     }, 50);
   });
@@ -302,31 +568,21 @@ async function processQueue() {
   }
 }
 
-// ── Thread Cache (model → threadId) ──
-const threadCache = new Map();
-
-async function getOrCreateThread(client, model) {
-  if (threadCache.has(model)) {
-    return threadCache.get(model);
+async function startThread(client, model, developerInstructions) {
+  const params = {
+    model,
+    cwd: CODEX_CWD,
+    approvalPolicy: 'never',
+    sandbox: 'danger-full-access',
+    ephemeral: true,
+  };
+  if (developerInstructions) {
+    params.developerInstructions = developerInstructions;
   }
-  try {
-    const { thread } = await client.request('thread/start', {
-      model,
-      cwd: CODEX_CWD,
-      approvalPolicy: 'never',
-      sandbox: 'danger-full-access',
-    });
-    threadCache.set(model, thread.id);
-    console.log(`[codex] new thread for ${model}: ${thread.id}`);
-    return thread.id;
-  } catch (err) {
-    threadCache.delete(model);  // invalidate on error
-    throw err;
-  }
-}
 
-function invalidateThread(model) {
-  threadCache.delete(model);
+  const { thread } = await client.request('thread/start', params);
+  console.log(`[codex] new thread for ${model}: ${thread.id}`);
+  return thread.id;
 }
 
 // ── Main ──
@@ -365,55 +621,29 @@ const server = http.createServer(async (req, res) => {
       const model = json.model || CODEX_MODEL;
       const stream = json.stream || false;
 
-      // 마지막 user 메시지 추출
-      const userMsgs = messages.filter((m) => m.role === 'user');
-      const lastMsg = userMsgs[userMsgs.length - 1];
-      if (!lastMsg) {
+      const builtInput = buildCodexInput(messages);
+      if (!builtInput) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: { message: 'No user message' } }));
         return;
       }
-
-      // Build input array — preserve both text and image content parts
-      // OpenWebUI sends Chat Completions format:
-      //   {type: "image_url", image_url: {url: "data:image/png;base64,..."}}
-      // Codex app-server expects:
-      //   text:  {type: "text", text: "..."}
-      //   image: {type: "image", url: "data:image/png;base64,..."}
-      let inputParts;
-      if (typeof lastMsg.content === 'string') {
-        inputParts = [{ type: 'text', text: lastMsg.content }];
-      } else {
-        inputParts = [];
-        for (const c of (lastMsg.content || [])) {
-          if (c.type === 'text') {
-            inputParts.push({ type: 'text', text: c.text || '' });
-          } else if (c.type === 'image_url') {
-            // Convert nested {url: "..."} → flat URL string for Codex
-            const url = c.image_url?.url || (typeof c.image_url === 'string' ? c.image_url : '');
-            if (url) {
-              inputParts.push({ type: 'image', url });
-            }
-          }
-        }
-        if (inputParts.length === 0) {
-          inputParts = [{ type: 'text', text: '' }];
-        }
-      }
+      const { inputParts, systemPrompt } = builtInput;
 
       // Serialize requests — prevents notification cross-talk between concurrent turns
       await enqueue(() => new Promise((qResolve, qReject) => {
         (async () => {
         try {
+          await codex.ensureReady();
           codex.drainNotifications();
           const cfg = getCodexConfig();
 
-          const threadId = await getOrCreateThread(codex, model);
+          const threadId = await startThread(codex, model, systemPrompt);
+          const summaryMode = cfg.reasoning ? (cfg.summary || 'detailed') : 'none';
           const turnResult = await codex.request('turn/start', {
             threadId,
             input: inputParts,
             model,
-            summary: cfg.summary || 'detailed',
+            summary: summaryMode,
           });
           const turnId = turnResult.turn?.id;
 
@@ -425,12 +655,16 @@ const server = http.createServer(async (req, res) => {
             });
 
             const chatId = `chatcmpl-${randomUUID().slice(0, 8)}`;
-            let seenIdx = 0;  // track last processed notification index
+            let seenIdx = 0;
             const tagFilter = new TagFilter();
             let agentMsgBuffer = [];
-            let hadCommand = false;  // true after first commandExecution in this turn
-            let agentMsgCount = 0;   // number of agentMessages started
-            let sentRole = false;    // send role: "assistant" in first chunk
+            let hadCommand = false;
+            let agentMsgCount = 0;
+            let sentRole = false;
+            let clientDisconnected = false;
+            let settled = false;
+            let interval = null;
+            let safetyTimeout = null;
 
             function sendChunk(field, text) {
               if (!text || res.writableEnded) return;
@@ -453,29 +687,67 @@ const server = http.createServer(async (req, res) => {
               agentMsgBuffer = [];
             }
 
-            // Keepalive: prevent OpenWebUI timeout during long tool executions
+            function finishStream() {
+              if (settled) return;
+              settled = true;
+              clearInterval(interval);
+              clearInterval(keepalive);
+              clearTimeout(safetyTimeout);
+              if (!res.writableEnded) {
+                const endChunk = {
+                  id: chatId, object: 'chat.completion.chunk',
+                  created: Math.floor(Date.now() / 1000), model,
+                  choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+                };
+                res.write(`data: ${JSON.stringify(endChunk)}\n\n`);
+                res.write('data: [DONE]\n\n');
+                res.end();
+              }
+              qResolve();
+            }
+
+            function finishStreamWithError(message) {
+              if (settled) return;
+              settled = true;
+              clearInterval(interval);
+              clearInterval(keepalive);
+              clearTimeout(safetyTimeout);
+              maybeScheduleCodexRestart(message);
+              if (!res.writableEnded) {
+                if (message) sendChunk('content', `Error: ${message}`);
+                const endChunk = {
+                  id: chatId, object: 'chat.completion.chunk',
+                  created: Math.floor(Date.now() / 1000), model,
+                  choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+                };
+                res.write(`data: ${JSON.stringify(endChunk)}\n\n`);
+                res.write('data: [DONE]\n\n');
+                res.end();
+              }
+              qResolve();
+            }
+
             const keepalive = setInterval(() => {
               if (!res.writableEnded) res.write(': keepalive\n\n');
             }, 15000);
 
-            // Client disconnect → clean up intervals
-            let clientDisconnected = false;
-            let safetyTimeout = null;
             req.on('close', () => {
-              if (res.writableEnded) return; // normal completion, not a disconnect
+              if (res.writableEnded || settled) return;
               clientDisconnected = true;
               clearInterval(interval);
               clearInterval(keepalive);
               clearTimeout(safetyTimeout);
               console.log('[codex] client disconnected');
+              qResolve();
             });
 
-            const interval = setInterval(() => {
-              if (clientDisconnected) return;
+            interval = setInterval(() => {
+              if (clientDisconnected || settled) return;
               const notifications = codex.notifications;
               for (let i = seenIdx; i < notifications.length; i++) {
                 const msg = notifications[i];
                 seenIdx = i + 1;
+                if (!notificationMatchesTurn(msg, turnId)) continue;
 
                 const p = msg.params ?? {};
 
@@ -488,7 +760,6 @@ const server = http.createServer(async (req, res) => {
                 }
 
                 if (msg.method === 'item/started' && p.item?.type === 'commandExecution') {
-                  // Previous agentMessage was thinking — flush as reasoning
                   if (cfg.reasoning) flushBuffer('reasoning_content');
                   else agentMsgBuffer = [];
                   hadCommand = true;
@@ -510,53 +781,47 @@ const server = http.createServer(async (req, res) => {
                   const filtered = tagFilter.filter(raw);
                   if (filtered) {
                     if (!hadCommand && agentMsgCount <= 1) {
-                      // First agentMessage, no commands yet — stream directly as content
                       sendChunk('content', filtered);
                     } else {
-                      // After commands, buffer (might be thinking or final answer)
                       agentMsgBuffer.push(filtered);
                     }
                   }
                 }
 
-                if (msg.method === 'error' || msg.method === 'codex/event/error') {
-                  invalidateThread(model);
+                if (cfg.toolDisplay && msg.method === 'item/completed') {
+                  const toolSummary = summarizeToolItem(p.item);
+                  if (toolSummary) sendChunk('content', toolSummary);
                 }
 
-                if (msg.method === 'turn/completed') {
-                  // Flush any remaining buffer as content (final answer)
-                  flushBuffer('content');
-                  const endChunk = {
-                    id: chatId, object: 'chat.completion.chunk',
-                    created: Math.floor(Date.now() / 1000), model,
-                    choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
-                  };
-                  if (!res.writableEnded) {
-                    res.write(`data: ${JSON.stringify(endChunk)}\n\n`);
-                    res.write('data: [DONE]\n\n');
+                if (msg.method === 'item/completed' && p.item?.type === 'agentMessage' && (hadCommand || agentMsgCount > 1)) {
+                  const completedText = stripArtifactTags(p.item.text || '').trim();
+                  if (completedText) {
+                    agentMsgBuffer = [completedText];
                   }
-                  clearInterval(interval);
-                  clearInterval(keepalive);
-                  clearTimeout(safetyTimeout);
-                  if (!res.writableEnded) res.end();
-                  qResolve();
+                  flushBuffer('content');
+                }
+
+                if (msg.method === 'error' && p.willRetry === false) {
+                  finishStreamWithError(p.error?.message || 'Codex turn failed');
+                  return;
+                }
+
+                if (msg.method === 'turn/completed' && p.turn?.id === turnId) {
+                  flushBuffer('content');
+                  finishStream();
                   return;
                 }
               }
             }, 50);
 
             safetyTimeout = setTimeout(() => {
-              clearInterval(interval);
-              clearInterval(keepalive);
-              if (!res.writableEnded) res.end();
-              qResolve();
+              finishStreamWithError('Timed out waiting for Codex turn completion.');
             }, 600_000);
 
           } else {
-            const done = await waitForNotification(
-              codex, 'turn/completed', (p) => p?.turn?.id === turnId
-            );
-            const text = extractText(codex.notifications).trim();
+            await waitForTurnOutcome(codex, turnId);
+            const turnNotifications = codex.notifications.filter((msg) => notificationMatchesTurn(msg, turnId));
+            const text = extractCompletedAgentText(turnNotifications) || extractText(turnNotifications).trim();
             const response = {
               id: `chatcmpl-${randomUUID().slice(0, 8)}`,
               object: 'chat.completion',

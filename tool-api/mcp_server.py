@@ -18,7 +18,7 @@ import uuid
 from typing import Optional
 
 from mcp.server import Server
-from mcp.types import Tool, TextContent
+from mcp.types import CallToolResult, Tool, TextContent
 from mcp.server.stdio import stdio_server
 
 # ── Qdrant + FastEmbed 직접 연결 (Tool API와 동일) ──
@@ -83,6 +83,24 @@ def scored_to_dict(p: ScoredPoint) -> dict:
     }
 
 
+def collection_exists(name: str) -> bool:
+    return name in {c.name for c in qdrant.get_collections().collections}
+
+
+def ok_result(payload: dict) -> CallToolResult:
+    return CallToolResult(
+        content=[TextContent(type="text", text=json.dumps(payload, ensure_ascii=False, indent=2))],
+        structuredContent=payload,
+    )
+
+
+def error_result(message: str) -> CallToolResult:
+    return CallToolResult(
+        content=[TextContent(type="text", text=message)],
+        isError=True,
+    )
+
+
 def get_projects() -> dict[str, list[str]]:
     collections = [c.name for c in qdrant.get_collections().collections]
     projects = {}
@@ -104,30 +122,44 @@ def ensure_collection(project: str, ctype: str) -> str:
         raise ValueError(f"invalid type: {ctype}")
 
     cname = f"{project}_{ctype}"
-    existing = {c.name for c in qdrant.get_collections().collections}
-    if cname in existing:
+    if collection_exists(cname):
         return cname
 
-    qdrant.create_collection(
-        collection_name=cname,
-        vectors_config=VectorParams(
-            size=EMBEDDING_DIM,
-            distance=Distance.COSINE,
-        ),
-    )
+    try:
+        qdrant.create_collection(
+            collection_name=cname,
+            vectors_config=VectorParams(
+                size=EMBEDDING_DIM,
+                distance=Distance.COSINE,
+            ),
+        )
+    except Exception:
+        if not collection_exists(cname):
+            raise
 
     for field in COLLECTION_TYPES[ctype]["indexes"]:
-        qdrant.create_payload_index(
-            collection_name=cname,
-            field_name=field,
-            field_schema=PayloadSchemaType.KEYWORD,
-        )
+        try:
+            qdrant.create_payload_index(
+                collection_name=cname,
+                field_name=field,
+                field_schema=PayloadSchemaType.KEYWORD,
+            )
+        except Exception:
+            if not collection_exists(cname):
+                raise
 
     return cname
 
 
 def do_search(project: str, ctype: str, query: str, limit: int = 5, filters: dict | None = None) -> list[dict]:
+    validate_project_name(project)
+    if ctype not in VALID_TYPES:
+        raise ValueError(f"invalid type: {ctype}")
+
     cname = f"{project}_{ctype}"
+    if not collection_exists(cname):
+        raise ValueError(f"collection not found: {cname}")
+
     query_vec = get_embedding(query)
 
     qdrant_filter = None
@@ -244,7 +276,7 @@ async def list_tools():
                     "type": {"type": "string", "description": "vuln | code | exploit | bugbounty", "enum": list(VALID_TYPES)},
                     "items": {
                         "type": "array",
-                        "description": "[{\"text\":\"...\", \"metadata\": {...}}, ...]",
+                        "description": '[{"text":"...", "metadata": {...}}, ...]',
                         "items": {
                             "type": "object",
                             "properties": {
@@ -272,7 +304,7 @@ async def call_tool(name: str, arguments: dict):
                 arguments["project"], "vuln", arguments["query"],
                 arguments.get("limit", 5), filters or None,
             )
-            return [TextContent(type="text", text=json.dumps({"count": len(results), "results": results}, ensure_ascii=False, indent=2))]
+            return ok_result({"count": len(results), "results": results})
 
         elif name == "search_code":
             filters = {}
@@ -282,7 +314,7 @@ async def call_tool(name: str, arguments: dict):
                 arguments["project"], "code", arguments["query"],
                 arguments.get("limit", 5), filters or None,
             )
-            return [TextContent(type="text", text=json.dumps({"count": len(results), "results": results}, ensure_ascii=False, indent=2))]
+            return ok_result({"count": len(results), "results": results})
 
         elif name == "search_exploit":
             filters = {}
@@ -292,7 +324,7 @@ async def call_tool(name: str, arguments: dict):
                 arguments["project"], "exploit", arguments["query"],
                 arguments.get("limit", 5), filters or None,
             )
-            return [TextContent(type="text", text=json.dumps({"count": len(results), "results": results}, ensure_ascii=False, indent=2))]
+            return ok_result({"count": len(results), "results": results})
 
         elif name == "search_bugbounty":
             filters = {}
@@ -302,7 +334,7 @@ async def call_tool(name: str, arguments: dict):
                 arguments["project"], "bugbounty", arguments["query"],
                 arguments.get("limit", 5), filters or None,
             )
-            return [TextContent(type="text", text=json.dumps({"count": len(results), "results": results}, ensure_ascii=False, indent=2))]
+            return ok_result({"count": len(results), "results": results})
 
         elif name == "list_projects":
             projects = get_projects()
@@ -316,13 +348,15 @@ async def call_tool(name: str, arguments: dict):
                 for t in types:
                     info = qdrant.get_collection(f"{proj}_{t}")
                     result[proj][t] = info.points_count
-            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+            return ok_result(result)
 
         elif name == "ingest_document":
             project = arguments["project"]
             ctype = arguments["type"]
             text = arguments["text"]
             metadata = arguments.get("metadata") or {}
+            if not isinstance(metadata, dict):
+                raise ValueError("metadata must be an object")
 
             cname = ensure_collection(project, ctype)
             point_id = str(uuid.uuid4())
@@ -336,7 +370,7 @@ async def call_tool(name: str, arguments: dict):
                 "collection": cname,
                 "id": point_id,
             }
-            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+            return ok_result(result)
 
         elif name == "ingest_batch":
             project = arguments["project"]
@@ -344,6 +378,8 @@ async def call_tool(name: str, arguments: dict):
             items = arguments["items"]
             if not items:
                 raise ValueError("items must not be empty")
+            if not all(isinstance(item, dict) for item in items):
+                raise ValueError("items must be objects")
 
             cname = ensure_collection(project, ctype)
             texts = [item["text"] for item in items]
@@ -353,7 +389,10 @@ async def call_tool(name: str, arguments: dict):
             for idx, item in enumerate(items):
                 point_id = str(uuid.uuid4())
                 ids.append(point_id)
-                payload = {**(item.get("metadata") or {}), "text": item["text"]}
+                metadata = item.get("metadata") or {}
+                if not isinstance(metadata, dict):
+                    raise ValueError("item metadata must be an object")
+                payload = {**metadata, "text": item["text"]}
                 points.append(PointStruct(id=point_id, vector=vectors[idx], payload=payload))
 
             qdrant.upsert(collection_name=cname, points=points)
@@ -363,13 +402,13 @@ async def call_tool(name: str, arguments: dict):
                 "count": len(points),
                 "ids": ids,
             }
-            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+            return ok_result(result)
 
         else:
-            return [TextContent(type="text", text=f"Unknown tool: {name}")]
+            return error_result(f"Unknown tool: {name}")
 
     except Exception as e:
-        return [TextContent(type="text", text=f"Error: {str(e)}")]
+        return error_result(str(e))
 
 
 async def main():
