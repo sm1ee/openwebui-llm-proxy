@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.openwebui.backup-cleanup</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/zsh</string>
+        <string>/PATH/TO/openwebui-llm-proxy/scripts/cleanup_openwebui_backups.sh</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>OPENWEBUI_BACKUP_DIR</key>
+        <string>/PATH/TO/openwebui-llm-proxy/backups/open-webui</string>
+        <key>OPENWEBUI_BACKUP_RETENTION_DAYS</key>
+        <string>7</string>
+        <key>OPENWEBUI_BACKUP_CLEANUP_LOG</key>
+        <string>/PATH/TO/openwebui-llm-proxy/logs/openwebui-backup-cleanup.log</string>
+    </dict>
+    <key>WorkingDirectory</key>
+    <string>/PATH/TO/openwebui-llm-proxy</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>4</integer>
+        <key>Minute</key>
+        <integer>17</integer>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>/tmp/openwebui-backup-cleanup.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/openwebui-backup-cleanup.stderr.log</string>
+</dict>
+</plist>
