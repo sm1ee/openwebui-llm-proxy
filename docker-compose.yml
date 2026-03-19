@@ -49,12 +49,22 @@ services:
       - "0.0.0.0:3000:8080"
     environment:
       WEBUI_AUTH: "true"
-      ENABLE_SIGNUP: "false"
+      ENABLE_SIGNUP: "true"
       # Codex proxy (맥 로컬 :8200)
       OPENAI_API_BASE_URLS: "http://host.docker.internal:8200/v1;http://host.docker.internal:8201/v1"
       OPENAI_API_KEYS: "dummy-codex;dummy-claude"
+      CODE_INTERPRETER_PROMPT_TEMPLATE: |-
+        #### Code Interpreter
+
+        You have access to a Python code interpreter via: `<code_interpreter type="code" lang="python"></code_interpreter>`
+
+        - When you need Python execution, put only executable Python code inside the XML tags so the tool can run it.
+        - Do NOT use triple backticks inside the XML tags.
+        - Always print meaningful outputs.
+        - After the interpreter output, continue with a normal chat response outside the XML tags and do not end the user-facing answer as only a code block.
     volumes:
       - open-webui-data:/app/backend/data
+      - ./open-webui-runtime-patches/middleware.py:/app/backend/open_webui/utils/middleware.py:ro
     depends_on:
       - tool-api
 
