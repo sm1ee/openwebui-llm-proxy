@@ -12,7 +12,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
@@ -69,6 +69,94 @@ const MODELS = [
   { id: 'sonnet', name: 'Claude Sonnet (alias)' },
   { id: 'haiku', name: 'Claude Haiku (alias)' },
 ];
+
+const activeChildPids = new Set();
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function collectDescendantPids(rootPid) {
+  let table = '';
+  try {
+    table = execFileSync('ps', ['-axo', 'pid=,ppid='], { encoding: 'utf8' });
+  } catch {
+    return [];
+  }
+
+  const childrenByParent = new Map();
+  for (const line of table.split('\n')) {
+    const [pidText, ppidText] = line.trim().split(/\s+/, 2);
+    const pid = Number(pidText);
+    const ppid = Number(ppidText);
+    if (!Number.isInteger(pid) || !Number.isInteger(ppid)) continue;
+    const children = childrenByParent.get(ppid) || [];
+    children.push(pid);
+    childrenByParent.set(ppid, children);
+  }
+
+  const descendants = [];
+  const stack = [...(childrenByParent.get(rootPid) || [])];
+  while (stack.length > 0) {
+    const pid = stack.pop();
+    descendants.push(pid);
+    const children = childrenByParent.get(pid);
+    if (children?.length) stack.push(...children);
+  }
+
+  return descendants;
+}
+
+async function killProcessTree(rootPid, label = 'process') {
+  if (!Number.isInteger(rootPid) || rootPid <= 0) return;
+
+  const targets = [...collectDescendantPids(rootPid).reverse(), rootPid];
+  const alive = (pid) => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  const termTargets = targets.filter(alive);
+  if (termTargets.length === 0) return;
+
+  console.log(`[claude] stopping ${label} pid=${rootPid} (${termTargets.length - 1} descendants)`);
+  for (const pid of termTargets) {
+    try { process.kill(pid, 'SIGTERM'); } catch {}
+  }
+
+  await sleep(1000);
+
+  const killTargets = targets.filter(alive);
+  if (killTargets.length === 0) return;
+
+  for (const pid of killTargets) {
+    try { process.kill(pid, 'SIGKILL'); } catch {}
+  }
+
+  await sleep(250);
+}
+
+function trackChildProcess(proc) {
+  if (Number.isInteger(proc?.pid) && proc.pid > 0) {
+    activeChildPids.add(proc.pid);
+  }
+}
+
+function untrackChildProcess(proc) {
+  if (Number.isInteger(proc?.pid) && proc.pid > 0) {
+    activeChildPids.delete(proc.pid);
+  }
+}
+
+async function terminateChildProcess(proc, reason) {
+  if (!proc || !Number.isInteger(proc.pid) || proc.exitCode !== null) return;
+  untrackChildProcess(proc);
+  await killProcessTree(proc.pid, reason);
+}
 
 function readBody(req) {
   return new Promise((resolve) => {
@@ -140,6 +228,33 @@ function extractSystemPrompt(messages) {
   return sysMsgs.join('\n\n') || '';
 }
 
+function trimBoundaryNewlines(text) {
+  return String(text || '')
+    .replace(/\r\n/g, '\n')
+    .replace(/^\n+/, '')
+    .replace(/\n+$/, '');
+}
+
+function buildFence(text) {
+  const matches = String(text || '').match(/`+/g) || [];
+  const longest = matches.reduce((max, run) => Math.max(max, run.length), 0);
+  return '`'.repeat(Math.max(3, longest + 1));
+}
+
+function formatCodeBlock(body, language = '') {
+  const normalized = trimBoundaryNewlines(body);
+  if (!normalized) return '';
+  const fence = buildFence(normalized);
+  const info = language ? String(language).trim() : '';
+  return `${fence}${info}\n${normalized}\n${fence}`;
+}
+
+function formatDisplayBlock(title, body = '', language = '') {
+  const normalized = trimBoundaryNewlines(body);
+  if (!normalized) return `\n\n**[${title}]**\n\n`;
+  return `\n\n**[${title}]**\n\n${formatCodeBlock(normalized, language)}\n\n`;
+}
+
 async function handleChatCompletion(json, req, res) {
   const messages = json.messages || [];
   const model = json.model || CLAUDE_MODEL;
@@ -172,6 +287,12 @@ async function handleChatCompletion(json, req, res) {
     args.push('--system-prompt', systemPrompt);
   }
 
+  function cleanupTempFiles() {
+    for (const f of tempFiles) {
+      try { fs.unlinkSync(f); } catch {}
+    }
+  }
+
   if (stream) {
     args.push('--output-format', 'stream-json', '--verbose', '--include-partial-messages');
 
@@ -185,9 +306,13 @@ async function handleChatCompletion(json, req, res) {
       stdio: ['pipe', 'pipe', 'pipe'],
       env: { ...process.env, TERM: 'dumb', CLAUDECODE: '' },
     });
+    trackChildProcess(proc);
+    let keepalive = null;
 
     proc.on('error', (err) => {
-      clearInterval(keepalive);
+      untrackChildProcess(proc);
+      if (keepalive) clearInterval(keepalive);
+      cleanupTempFiles();
       console.error(`[claude spawn error] ${err.message}`);
       if (!res.writableEnded) {
         res.write(`data: ${JSON.stringify({
@@ -205,7 +330,7 @@ async function handleChatCompletion(json, req, res) {
 
     // Keepalive: Opus 등 느린 모델은 첫 응답까지 오래 걸림
     // OpenWebUI 타임아웃 방지를 위해 15초마다 SSE comment 전송
-    const keepalive = setInterval(() => {
+    keepalive = setInterval(() => {
       if (!res.writableEnded) res.write(': keepalive\n\n');
     }, 15000);
 
@@ -223,8 +348,10 @@ async function handleChatCompletion(json, req, res) {
     req.on('close', () => {
       clientDisconnected = true;
       if (proc.exitCode === null && !proc.killed) {
-        console.log('[claude] client disconnected, killing process');
-        proc.kill('SIGTERM');
+        console.log('[claude] client disconnected, killing process tree');
+        terminateChildProcess(proc, 'claude client disconnected').catch((err) => {
+          console.error('[claude] failed to stop disconnected child tree:', err.message);
+        });
       }
     });
 
@@ -257,7 +384,7 @@ async function handleChatCompletion(json, req, res) {
             if (ev.type === 'content_block_start') {
               const cb = ev.content_block || {};
               if (cb.type === 'tool_use' && cb.name && cfg.toolDisplay) {
-                sendChunk('content', `\n\n> **[Tool: ${cb.name}]** `);
+                sendChunk('content', `\n\n**[Tool: ${cb.name}]**\n\n`);
               }
             } else if (ev.type === 'content_block_delta') {
               const delta = ev.delta || {};
@@ -285,7 +412,7 @@ async function handleChatCompletion(json, req, res) {
                   const display = inputStr.length > 200
                     ? inputStr.slice(0, 200) + '...'
                     : inputStr;
-                  sendChunk('content', `\`${display}\`\n\n`);
+                  sendChunk('content', formatDisplayBlock(`Tool: ${block.name || 'input'}`, display, 'json'));
                 }
               } else if ((block.type === 'thinking' || block.type === 'reasoning' || block.type === 'reasoning_content') && !sawReasoningDelta) {
                 const thinkingText = block.thinking || block.text || '';
@@ -313,9 +440,9 @@ async function handleChatCompletion(json, req, res) {
                   ? output.slice(0, 500) + '\n... (truncated)'
                   : output;
                 if (block.is_error) {
-                  sendChunk('content', `\n> **[Error]** \`${truncated}\`\n\n`);
+                  sendChunk('content', formatDisplayBlock('Error', truncated));
                 } else {
-                  sendChunk('content', `\n> \`\`\`\n${truncated}\n\`\`\`\n\n`);
+                  sendChunk('content', formatDisplayBlock('Tool Result', truncated));
                 }
               }
             }
@@ -352,7 +479,8 @@ async function handleChatCompletion(json, req, res) {
 
     proc.on('close', (code, signal) => {
       clearInterval(keepalive);
-      for (const f of tempFiles) { try { fs.unlinkSync(f); } catch {} }
+      untrackChildProcess(proc);
+      cleanupTempFiles();
       if (res.writableEnded) return;
 
       const stderrMessage = stderrBuffer.trim();
@@ -386,6 +514,7 @@ async function handleChatCompletion(json, req, res) {
       stdio: ['pipe', 'pipe', 'pipe'],
       env: { ...process.env, TERM: 'dumb', CLAUDECODE: '' },
     });
+    trackChildProcess(proc);
 
     proc.stdin.write(prompt);
     proc.stdin.end();
@@ -395,8 +524,25 @@ async function handleChatCompletion(json, req, res) {
     proc.stdout.on('data', (d) => { stdout += d.toString(); });
     proc.stderr.on('data', (d) => { stderr += d.toString(); });
 
-    const exitCode = await new Promise((resolve) => proc.on('close', resolve));
-    for (const f of tempFiles) { try { fs.unlinkSync(f); } catch {} }
+    res.on('close', () => {
+      if (res.writableEnded || proc.exitCode !== null || proc.killed) return;
+      console.log('[claude] client disconnected during non-stream response, killing process tree');
+      terminateChildProcess(proc, 'claude non-stream client disconnected').catch((err) => {
+        console.error('[claude] failed to stop non-stream child tree:', err.message);
+      });
+    });
+
+    const exitCode = await new Promise((resolve) => {
+      proc.on('error', (err) => {
+        untrackChildProcess(proc);
+        stderr += err.message;
+      });
+      proc.on('close', (code) => {
+        untrackChildProcess(proc);
+        resolve(code);
+      });
+    });
+    cleanupTempFiles();
 
     if (stderr.trim()) {
       console.error(`[claude stderr] ${stderr.trim()}`);
@@ -490,6 +636,57 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ error: { message: err.message } }));
     }
   }
+});
+
+let shuttingDown = false;
+
+async function shutdownProxy(reason, exitCode = 0) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`[claude-proxy] shutting down (${reason})`);
+
+  try {
+    server.close();
+  } catch {}
+
+  const childPids = [...activeChildPids];
+  await Promise.allSettled(childPids.map((pid) => killProcessTree(pid, reason)));
+  activeChildPids.clear();
+
+  process.exit(exitCode);
+}
+
+server.on('error', (err) => {
+  console.error('[server error]', err);
+  shutdownProxy(`server error: ${err.message}`, 1).catch((shutdownErr) => {
+    console.error('[claude-proxy] shutdown after server error failed:', shutdownErr.message);
+    process.exit(1);
+  });
+});
+
+for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+  process.on(signal, () => {
+    shutdownProxy(`received ${signal}`, 0).catch((err) => {
+      console.error('[claude-proxy] signal shutdown failed:', err.message);
+      process.exit(1);
+    });
+  });
+}
+
+process.on('uncaughtException', (err) => {
+  console.error('[uncaughtException]', err);
+  shutdownProxy('uncaughtException', 1).catch((shutdownErr) => {
+    console.error('[claude-proxy] uncaughtException shutdown failed:', shutdownErr.message);
+    process.exit(1);
+  });
+});
+
+process.on('unhandledRejection', (reason) => {
+  console.error('[unhandledRejection]', reason);
+  shutdownProxy('unhandledRejection', 1).catch((shutdownErr) => {
+    console.error('[claude-proxy] unhandledRejection shutdown failed:', shutdownErr.message);
+    process.exit(1);
+  });
 });
 
 server.listen(PORT, '0.0.0.0', () => {

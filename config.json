@@ -1,13 +1,13 @@
 {
   "claude": {
     "thinking": false,
-    "toolDisplay": true,
+    "toolDisplay": false,
     "debugLog": false,
     "effort": "high"
   },
   "codex": {
     "reasoning": false,
-    "toolDisplay": true,
+    "toolDisplay": false,
     "summary": "detailed"
   }
 }

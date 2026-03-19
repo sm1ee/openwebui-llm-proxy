@@ -11,7 +11,7 @@
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
@@ -61,6 +61,74 @@ const CODEX_BIN = process.env.CODEX_BIN || 'codex';
 const CODEX_MODEL = process.env.CODEX_MODEL || 'gpt-5.4';
 const CODEX_CWD = process.env.CODEX_CWD || new URL('.', import.meta.url).pathname.replace(/\/llm-proxy\/$/, '/codex-sandbox');
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function collectDescendantPids(rootPid) {
+  let table = '';
+  try {
+    table = execFileSync('ps', ['-axo', 'pid=,ppid='], { encoding: 'utf8' });
+  } catch {
+    return [];
+  }
+
+  const childrenByParent = new Map();
+  for (const line of table.split('\n')) {
+    const [pidText, ppidText] = line.trim().split(/\s+/, 2);
+    const pid = Number(pidText);
+    const ppid = Number(ppidText);
+    if (!Number.isInteger(pid) || !Number.isInteger(ppid)) continue;
+    const children = childrenByParent.get(ppid) || [];
+    children.push(pid);
+    childrenByParent.set(ppid, children);
+  }
+
+  const descendants = [];
+  const stack = [...(childrenByParent.get(rootPid) || [])];
+  while (stack.length > 0) {
+    const pid = stack.pop();
+    descendants.push(pid);
+    const children = childrenByParent.get(pid);
+    if (children?.length) stack.push(...children);
+  }
+
+  return descendants;
+}
+
+async function killProcessTree(rootPid, label = 'process') {
+  if (!Number.isInteger(rootPid) || rootPid <= 0) return;
+
+  const targets = [...collectDescendantPids(rootPid).reverse(), rootPid];
+  const alive = (pid) => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  const termTargets = targets.filter(alive);
+  if (termTargets.length === 0) return;
+
+  console.log(`[codex] stopping ${label} pid=${rootPid} (${termTargets.length - 1} descendants)`);
+  for (const pid of termTargets) {
+    try { process.kill(pid, 'SIGTERM'); } catch {}
+  }
+
+  await sleep(1000);
+
+  const killTargets = targets.filter(alive);
+  if (killTargets.length === 0) return;
+
+  for (const pid of killTargets) {
+    try { process.kill(pid, 'SIGKILL'); } catch {}
+  }
+
+  await sleep(250);
+}
+
 // ── Codex App Server Client ──
 class CodexClient {
   constructor() {
@@ -71,75 +139,115 @@ class CodexClient {
     this.rl = null;
     this.ready = false;
     this.modelList = [];
+    this.startPromise = null;
     this.restartPromise = null;
+    this.expectedExitPids = new Set();
   }
 
   async start() {
     if (this.ready && this.proc && this.proc.exitCode === null) return;
+    if (this.startPromise) return this.startPromise;
 
-    this.proc = spawn(CODEX_BIN, ['app-server'], {
-      stdio: ['pipe', 'pipe', 'inherit'],
-      cwd: CODEX_CWD,
-      env: process.env,
+    this.startPromise = (async () => {
+      const proc = spawn(CODEX_BIN, ['app-server'], {
+        stdio: ['pipe', 'pipe', 'inherit'],
+        cwd: CODEX_CWD,
+        env: process.env,
+      });
+      this.proc = proc;
+
+      proc.on('exit', (code, signal) => {
+        const expected = this.expectedExitPids.delete(proc.pid);
+        if (!expected) {
+          console.error(`[codex] exited: ${signal || code}`);
+        }
+
+        if (this.proc === proc) {
+          this.ready = false;
+          this.proc = null;
+          this.rl = null;
+        }
+
+        for (const { reject, timer } of this.pending.values()) {
+          clearTimeout(timer);
+          reject(new Error('codex exited'));
+        }
+        this.pending.clear();
+      });
+
+      this.rl = createInterface({ input: proc.stdout });
+      this.rl.on('line', (line) => this._handleLine(line));
+
+      await this.request('initialize', {
+        clientInfo: {
+          name: 'codex_openai_proxy',
+          title: 'Codex OpenAI Proxy',
+          version: '1.0.0',
+        },
+      });
+      this.notify('initialized', {});
+      this.ready = true;
+
+      // 모델 목록 캐싱
+      const models = await this.request('model/list', { limit: 100, includeHidden: false });
+      this.modelList = models.data || [];
+      console.log(`[codex] ready. ${this.modelList.length} models available.`);
+    })().finally(() => {
+      this.startPromise = null;
     });
 
-    this.proc.on('exit', (code, signal) => {
-      console.error(`[codex] exited: ${signal || code}`);
-      this.ready = false;
-      this.proc = null;
-      this.rl = null;
-      for (const { reject } of this.pending.values()) {
-        reject(new Error('codex exited'));
-      }
-      this.pending.clear();
-    });
-
-    this.rl = createInterface({ input: this.proc.stdout });
-    this.rl.on('line', (line) => this._handleLine(line));
-
-    await this.request('initialize', {
-      clientInfo: {
-        name: 'codex_openai_proxy',
-        title: 'Codex OpenAI Proxy',
-        version: '1.0.0',
-      },
-    });
-    this.notify('initialized', {});
-    this.ready = true;
-
-    // 모델 목록 캐싱
-    const models = await this.request('model/list', { limit: 100, includeHidden: false });
-    this.modelList = models.data || [];
-    console.log(`[codex] ready. ${this.modelList.length} models available.`);
+    return this.startPromise;
   }
 
   async ensureReady() {
     if (this.ready && this.proc && this.proc.exitCode === null) return;
-    await this.restart();
+    if (this.restartPromise) {
+      await this.restartPromise;
+      return;
+    }
+    await this.start();
   }
 
-  async restart() {
+  async stop(reason = 'shutdown') {
+    const proc = this.proc;
+    const rl = this.rl;
+
+    this.ready = false;
+    this.proc = null;
+    this.rl = null;
+
+    if (rl) {
+      try { rl.close(); } catch {}
+    }
+
+    for (const { reject, timer } of this.pending.values()) {
+      clearTimeout(timer);
+      reject(new Error(reason));
+    }
+    this.pending.clear();
+
+    if (!proc || proc.exitCode !== null) return;
+
+    this.expectedExitPids.add(proc.pid);
+    await killProcessTree(proc.pid, reason);
+  }
+
+  async restart(reason = 'restart requested') {
     if (this.restartPromise) return this.restartPromise;
 
     this.restartPromise = (async () => {
-      console.log('[codex] restarting app-server');
-      this.ready = false;
-
-      if (this.rl) {
-        try { this.rl.close(); } catch {}
-        this.rl = null;
-      }
-
-      if (this.proc && this.proc.exitCode === null && !this.proc.killed) {
-        try { this.proc.kill('SIGTERM'); } catch {}
-      }
-      this.proc = null;
+      console.log(`[codex] restarting app-server (${reason})`);
+      await this.stop(reason);
       await this.start();
     })().finally(() => {
       this.restartPromise = null;
     });
 
     return this.restartPromise;
+  }
+
+  async shutdown(reason = 'shutdown requested') {
+    await this.stop(reason);
   }
 
   request(method, params = {}) {
@@ -279,120 +387,174 @@ function buildCodexInput(messages) {
   };
 }
 
-function decodeQuotedString(text) {
-  const value = text.trim();
-  if (
-    (value.startsWith('"') && value.endsWith('"'))
-    || (value.startsWith('\'') && value.endsWith('\''))
-  ) {
-    return value
-      .slice(1, -1)
-      .replace(/\\\\/g, '\\')
-      .replace(/\\n/g, '\n')
-      .replace(/\\t/g, '\t')
-      .replace(/\\"/g, '"')
-      .replace(/\\'/g, '\'');
-  }
-  return null;
+const ARTIFACT_TAG_NAMES = [
+  'code_interpreter',
+  'exec',
+  'shell',
+  'apply_diff',
+  'read_file',
+  'write_file',
+  'run_command',
+];
+const ARTIFACT_TAG_PATTERN = ARTIFACT_TAG_NAMES.join('|');
+const ARTIFACT_OPEN_RE = new RegExp(`<(${ARTIFACT_TAG_PATTERN})\\b`, 'i');
+const ARTIFACT_BLOCK_RE = new RegExp(
+  `<(${ARTIFACT_TAG_PATTERN})\\b([^>]*)>([\\s\\S]*?)<\\/\\1\\s*>`,
+  'gi',
+);
+
+function escapeRegExp(text) {
+  return String(text || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-function extractToolBodyText(body) {
-  const lines = body
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
-
-  if (lines.length === 0) return '';
-
-  const extracted = [];
-  for (const line of lines) {
-    const match = line.match(/^(?:print|console\.log)\(\s*(['"].*['"])\s*\)\s*;?$/);
-    if (!match) return '';
-    const decoded = decodeQuotedString(match[1]);
-    if (decoded === null) return '';
-    extracted.push(decoded);
-  }
-
-  return extracted.join('\n');
+function extractTagAttribute(attrs, name) {
+  const match = String(attrs || '').match(new RegExp(`\\b${name}\\s*=\\s*(['"])(.*?)\\1`, 'i'));
+  return match?.[2] || '';
 }
 
-// ── Codex XML tag stripping (streaming state machine) ──
-// Codex wraps tool calls in XML: <code_interpreter type="code" lang="python">print("text")</code_interpreter>
-// We collect the tool body, then extract the meaningful text from print() calls.
+function defaultArtifactLanguage(tagName) {
+  switch (String(tagName || '').toLowerCase()) {
+    case 'code_interpreter':
+      return '';
+    case 'shell':
+    case 'exec':
+    case 'run_command':
+      return 'bash';
+    case 'apply_diff':
+      return 'diff';
+    default:
+      return '';
+  }
+}
+
+function trimBoundaryNewlines(text) {
+  return String(text || '')
+    .replace(/\r\n/g, '\n')
+    .replace(/^\n+/, '')
+    .replace(/\n+$/, '');
+}
+
+function buildFence(text) {
+  const matches = String(text || '').match(/`+/g) || [];
+  const longest = matches.reduce((max, run) => Math.max(max, run.length), 0);
+  return '`'.repeat(Math.max(3, longest + 1));
+}
+
+function formatCodeBlock(body, language = '') {
+  const normalized = trimBoundaryNewlines(body);
+  if (!normalized) return '';
+  const fence = buildFence(normalized);
+  const info = language ? String(language).trim() : '';
+  return `${fence}${info}\n${normalized}\n${fence}`;
+}
+
+function renderArtifactTag(tagName, attrs, body) {
+  const normalized = trimBoundaryNewlines(body);
+  if (!normalized) return '';
+  const language = extractTagAttribute(attrs, 'lang')
+    || extractTagAttribute(attrs, 'language')
+    || defaultArtifactLanguage(tagName);
+  return `\n\n${formatCodeBlock(normalized, language)}\n\n`;
+}
+
+function parseOpenTag(openTagText) {
+  const match = String(openTagText || '').match(/^<([a-z_][\w-]*)([\s\S]*?)>$/i);
+  if (!match) return null;
+  return {
+    tagName: match[1].toLowerCase(),
+    attrs: match[2] || '',
+  };
+}
+
+function splitTrailingPartialTag(text) {
+  const lastLt = text.lastIndexOf('<');
+  if (lastLt === -1) return { safe: text, remainder: '' };
+  const tail = text.slice(lastLt);
+  if (tail.includes('>')) return { safe: text, remainder: '' };
+  if (/^<\/?[a-z_][\w-]*(?:[\s"'=:/.-][^>]*)?$/i.test(tail)) {
+    return { safe: text.slice(0, lastLt), remainder: tail };
+  }
+  return { safe: text, remainder: '' };
+}
+
+// ── Codex XML tag conversion (streaming-safe) ──
+// Codex can emit structured XML-ish artifacts like
+// <code_interpreter type="code" lang="python">...</code_interpreter>.
+// Convert them to normal Markdown code fences so Open WebUI renders them.
 class TagFilter {
   constructor() {
-    this.inTag = false;
-    this.inToolBody = false;
-    this.inClosingTag = false;
-    this.toolBodyParts = [];   // accumulate tool body tokens
+    this.buffer = '';
   }
 
   filter(delta) {
-    const t = delta.trim();
-
-    // Detect opening tag start
-    if (/^<(?:code|file|exec|shell|apply_diff|read_file|write_file|run_command)/i.test(t)) {
-      this.inTag = true;
-      if (t.endsWith('>')) {
-        this.inTag = false;
-        this.inToolBody = true;
-        this.toolBodyParts = [];
-      }
-      return '';
-    }
-
-    // Detect closing tag start — extract text from accumulated body
-    if (t === '</' || /^<\/[a-z]/i.test(t)) {
-      const extracted = this.inToolBody ? this._extractText() : '';
-      this.inToolBody = false;
-      this.inClosingTag = true;
-      if (t.endsWith('>')) this.inClosingTag = false;
-      return extracted;
-    }
-
-    // Inside opening tag attributes
-    if (this.inTag) {
-      if (t.includes('>')) {
-        this.inTag = false;
-        this.inToolBody = true;
-        this.toolBodyParts = [];
-      }
-      return '';
-    }
-
-    // Inside tool body — accumulate
-    if (this.inToolBody) {
-      this.toolBodyParts.push(delta);
-      return '';
-    }
-
-    // Inside closing tag
-    if (this.inClosingTag) {
-      if (t.includes('>')) this.inClosingTag = false;
-      return '';
-    }
-
-    if (t === '</>' || t === '/>') return '';
-
-    return delta;
+    if (!delta) return '';
+    this.buffer += delta;
+    return this._drain(false);
   }
 
-  _extractText() {
-    const body = this.toolBodyParts.join('').trim();
-    this.toolBodyParts = [];
-    if (!body) return '';
-    return extractToolBodyText(body);
+  flush() {
+    if (!this.buffer) return '';
+    return this._drain(true);
+  }
+
+  reset() {
+    this.buffer = '';
+  }
+
+  _drain(flushAll) {
+    let output = '';
+
+    while (this.buffer) {
+      const openMatch = this.buffer.match(ARTIFACT_OPEN_RE);
+      if (!openMatch) {
+        if (flushAll) {
+          output += this.buffer;
+          this.buffer = '';
+        } else {
+          const { safe, remainder } = splitTrailingPartialTag(this.buffer);
+          output += safe;
+          this.buffer = remainder;
+        }
+        break;
+      }
+
+      const start = openMatch.index ?? 0;
+      if (start > 0) {
+        output += this.buffer.slice(0, start);
+        this.buffer = this.buffer.slice(start);
+        continue;
+      }
+
+      const openEnd = this.buffer.indexOf('>');
+      if (openEnd === -1) break;
+
+      const parsed = parseOpenTag(this.buffer.slice(0, openEnd + 1));
+      if (!parsed) {
+        output += this.buffer[0];
+        this.buffer = this.buffer.slice(1);
+        continue;
+      }
+
+      const afterOpen = this.buffer.slice(openEnd + 1);
+      const closeRe = new RegExp(`</${escapeRegExp(parsed.tagName)}\\s*>`, 'i');
+      const closeMatch = afterOpen.match(closeRe);
+      if (!closeMatch || typeof closeMatch.index !== 'number') break;
+
+      const body = afterOpen.slice(0, closeMatch.index);
+      output += renderArtifactTag(parsed.tagName, parsed.attrs, body);
+      this.buffer = afterOpen.slice(closeMatch.index + closeMatch[0].length);
+    }
+
+    return output;
   }
 }
 
-// For non-streaming: strip XML tags and extract print() content
+// For non-streaming / completed messages: convert XML-ish artifacts to Markdown.
 function stripArtifactTags(text) {
   return text
-    .replace(/<(?:code_interpreter|code|file|exec|shell|apply_diff|read_file|write_file|run_command)[^>]*>([\s\S]*?)<\/[^>]+>/gi, (_, body) => {
-      return extractToolBodyText(body);
-    })
-    .replace(/<\/?(?:code_interpreter|code|file|exec|shell|apply_diff|read_file|write_file|run_command)[^>]*>/gi, '')
-    .replace(/<\/?>/g, '');
+    .replace(ARTIFACT_BLOCK_RE, (_, tagName, attrs, body) => renderArtifactTag(tagName, attrs, body))
+    .replace(new RegExp(`</?(?:${ARTIFACT_TAG_PATTERN})\\b[^>]*>`, 'gi'), '')
+    .replace(/<\/>/g, '');
 }
 
 // ── Extract text from notifications ──
@@ -412,6 +574,48 @@ function extractText(notifications) {
     }
   }
   return stripArtifactTags(parts.join(''));
+}
+
+function extractAgentMessageDeltaText(notifications) {
+  const parts = [];
+  const tagFilter = new TagFilter();
+  let current = [];
+  let sawDelta = false;
+
+  function flushCurrent() {
+    const trailing = tagFilter.flush();
+    if (trailing) current.push(trailing);
+    const cleaned = stripArtifactTags(current.join('')).trim();
+    if (cleaned) parts.push(cleaned);
+    current = [];
+    tagFilter.reset();
+  }
+
+  for (const msg of notifications) {
+    const p = msg.params ?? {};
+
+    if (msg.method === 'item/started' && p.item?.type === 'agentMessage') {
+      if (current.length > 0) flushCurrent();
+      continue;
+    }
+
+    if (msg.method === 'item/agentMessage/delta') {
+      const raw = typeof p.delta === 'string' ? p.delta
+        : typeof p.delta?.text === 'string' ? p.delta.text
+        : typeof p.text === 'string' ? p.text : '';
+      const filtered = tagFilter.filter(raw);
+      if (filtered) current.push(filtered);
+      if (raw) sawDelta = true;
+      continue;
+    }
+
+    if (msg.method === 'item/completed' && p.item?.type === 'agentMessage') {
+      flushCurrent();
+    }
+  }
+
+  if (current.length > 0 || tagFilter.buffer) flushCurrent();
+  return sawDelta ? parts.join('\n\n').trim() : '';
 }
 
 function extractCompletedAgentText(notifications) {
@@ -434,7 +638,7 @@ function notificationMatchesTurn(msg, turnId) {
 }
 
 function truncateDisplayText(text, maxChars = 1200, maxLines = 40) {
-  const normalized = String(text || '').trim();
+  const normalized = trimBoundaryNewlines(text);
   if (!normalized) return '';
 
   const lines = normalized.split('\n');
@@ -447,9 +651,9 @@ function truncateDisplayText(text, maxChars = 1200, maxLines = 40) {
 }
 
 function formatToolBlock(title, body = '') {
-  const safeBody = truncateDisplayText(body).replace(/~~~/g, '~~\\~');
-  if (!safeBody) return `\n\n> **[${title}]**\n\n`;
-  return `\n\n> **[${title}]**\n\n~~~text\n${safeBody}\n~~~\n\n`;
+  const safeBody = truncateDisplayText(body);
+  if (!safeBody) return `\n\n**[${title}]**\n\n`;
+  return `\n\n**[${title}]**\n\n${formatCodeBlock(safeBody)}\n\n`;
 }
 
 function summarizeMcpResult(result) {
@@ -500,11 +704,12 @@ function summarizeToolItem(item) {
   return '';
 }
 
-function maybeScheduleCodexRestart(message) {
-  if (!/401 Unauthorized|Missing bearer or basic authentication/i.test(message || '')) return;
+function maybeScheduleCodexRestart(message, { force = false } = {}) {
+  const text = String(message || '');
+  if (!force && !/401 Unauthorized|Missing bearer or basic authentication|timeout waiting for turn\/completed|timed out waiting for codex turn completion|stream disconnected before completion|codex exited|client disconnected/i.test(text)) return;
   setTimeout(() => {
-    codex.restart().catch((err) => {
-      console.error('[codex] restart failed after upstream auth error:', err.message);
+    codex.restart(text || 'scheduled recovery').catch((err) => {
+      console.error('[codex] restart failed after recovery trigger:', err.message);
     });
   }, 0);
 }
@@ -535,6 +740,7 @@ function waitForTurnOutcome(client, turnId, timeoutMs = 600_000) {
 
       if (Date.now() - start > timeoutMs) {
         clearInterval(interval);
+        maybeScheduleCodexRestart('timeout waiting for turn/completed', { force: true });
         reject(new Error('timeout waiting for turn/completed'));
       }
     }, 50);
@@ -587,7 +793,6 @@ async function startThread(client, model, developerInstructions) {
 
 // ── Main ──
 const codex = new CodexClient();
-await codex.start();
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost:${PORT}`);
@@ -602,6 +807,7 @@ const server = http.createServer(async (req, res) => {
   try {
     // GET /v1/models
     if (path === '/v1/models' && req.method === 'GET') {
+      await codex.ensureReady();
       const data = codex.modelList.map((m) => ({
         id: m.id,
         object: 'model',
@@ -687,6 +893,16 @@ const server = http.createServer(async (req, res) => {
               agentMsgBuffer = [];
             }
 
+            function flushAgentContent(fallbackText = '') {
+              const trailing = tagFilter.flush();
+              if (trailing) agentMsgBuffer.push(trailing);
+              const bufferedText = stripArtifactTags(agentMsgBuffer.join('')).trim();
+              const fallback = stripArtifactTags(fallbackText).trim();
+              const text = bufferedText || fallback;
+              if (text) sendChunk('content', text);
+              agentMsgBuffer = [];
+            }
+
             function finishStream() {
               if (settled) return;
               settled = true;
@@ -738,6 +954,7 @@ const server = http.createServer(async (req, res) => {
               clearInterval(keepalive);
               clearTimeout(safetyTimeout);
               console.log('[codex] client disconnected');
+              maybeScheduleCodexRestart('client disconnected', { force: true });
               qResolve();
             });
 
@@ -754,9 +971,7 @@ const server = http.createServer(async (req, res) => {
                 if (msg.method === 'item/started' && p.item?.type === 'agentMessage') {
                   agentMsgBuffer = [];
                   agentMsgCount++;
-                  tagFilter.inTag = false;
-                  tagFilter.inToolBody = false;
-                  tagFilter.inClosingTag = false;
+                  tagFilter.reset();
                 }
 
                 if (msg.method === 'item/started' && p.item?.type === 'commandExecution') {
@@ -794,11 +1009,13 @@ const server = http.createServer(async (req, res) => {
                 }
 
                 if (msg.method === 'item/completed' && p.item?.type === 'agentMessage' && (hadCommand || agentMsgCount > 1)) {
-                  const completedText = stripArtifactTags(p.item.text || '').trim();
-                  if (completedText) {
-                    agentMsgBuffer = [completedText];
-                  }
-                  flushBuffer('content');
+                  flushAgentContent(p.item.text || '');
+                  tagFilter.reset();
+                }
+
+                if (msg.method === 'item/completed' && p.item?.type === 'agentMessage' && !hadCommand && agentMsgCount <= 1) {
+                  const trailingText = tagFilter.flush().trim();
+                  if (trailingText) sendChunk('content', trailingText);
                 }
 
                 if (msg.method === 'error' && p.willRetry === false) {
@@ -807,6 +1024,10 @@ const server = http.createServer(async (req, res) => {
                 }
 
                 if (msg.method === 'turn/completed' && p.turn?.id === turnId) {
+                  if (!hadCommand && agentMsgCount <= 1) {
+                    const trailingText = tagFilter.flush().trim();
+                    if (trailingText) sendChunk('content', trailingText);
+                  }
                   flushBuffer('content');
                   finishStream();
                   return;
@@ -815,14 +1036,16 @@ const server = http.createServer(async (req, res) => {
             }, 50);
 
             safetyTimeout = setTimeout(() => {
-              finishStreamWithError('Timed out waiting for Codex turn completion.');
+              finishStreamWithError('timeout waiting for turn/completed');
             }, 600_000);
 
           } else {
-            await waitForTurnOutcome(codex, turnId);
-            const turnNotifications = codex.notifications.filter((msg) => notificationMatchesTurn(msg, turnId));
-            const text = extractCompletedAgentText(turnNotifications) || extractText(turnNotifications).trim();
-            const response = {
+	            await waitForTurnOutcome(codex, turnId);
+	            const turnNotifications = codex.notifications.filter((msg) => notificationMatchesTurn(msg, turnId));
+	            const text = extractAgentMessageDeltaText(turnNotifications)
+	              || extractCompletedAgentText(turnNotifications)
+	              || extractText(turnNotifications).trim();
+	            const response = {
               id: `chatcmpl-${randomUUID().slice(0, 8)}`,
               object: 'chat.completion',
               created: Math.floor(Date.now() / 1000), model,
@@ -834,6 +1057,7 @@ const server = http.createServer(async (req, res) => {
             qResolve();
           }
         } catch (err) {
+          maybeScheduleCodexRestart(err?.message || '');
           qReject(err);
         }
         })();
@@ -884,6 +1108,26 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+let shuttingDown = false;
+
+async function shutdownProxy(reason, exitCode = 0) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`[codex-proxy] shutting down (${reason})`);
+
+  try {
+    server.close();
+  } catch {}
+
+  try {
+    await codex.shutdown(reason);
+  } catch (err) {
+    console.error('[codex-proxy] failed to stop codex child tree:', err.message);
+  }
+
+  process.exit(exitCode);
+}
+
 function readBody(req) {
   return new Promise((resolve) => {
     let data = '';
@@ -892,7 +1136,45 @@ function readBody(req) {
   });
 }
 
-server.listen(PORT, '0.0.0.0', () => {
+server.on('error', (err) => {
+  console.error('[server error]', err);
+  shutdownProxy(`server error: ${err.message}`, 1).catch((shutdownErr) => {
+    console.error('[codex-proxy] shutdown after server error failed:', shutdownErr.message);
+    process.exit(1);
+  });
+});
+
+for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+  process.on(signal, () => {
+    shutdownProxy(`received ${signal}`, 0).catch((err) => {
+      console.error('[codex-proxy] signal shutdown failed:', err.message);
+      process.exit(1);
+    });
+  });
+}
+
+process.on('uncaughtException', (err) => {
+  console.error('[uncaughtException]', err);
+  shutdownProxy('uncaughtException', 1).catch((shutdownErr) => {
+    console.error('[codex-proxy] uncaughtException shutdown failed:', shutdownErr.message);
+    process.exit(1);
+  });
+});
+
+process.on('unhandledRejection', (reason) => {
+  console.error('[unhandledRejection]', reason);
+  shutdownProxy('unhandledRejection', 1).catch((shutdownErr) => {
+    console.error('[codex-proxy] unhandledRejection shutdown failed:', shutdownErr.message);
+    process.exit(1);
+  });
+});
+
+server.listen(PORT, '0.0.0.0', async () => {
+  try {
+    await codex.ensureReady();
+  } catch (err) {
+    console.error('[codex] initial startup failed:', err.message);
+  }
   console.log(`[codex-proxy] listening on http://0.0.0.0:${PORT}`);
   console.log(`[codex-proxy] OpenWebUI endpoint: http://host.docker.internal:${PORT}/v1`);
 });
