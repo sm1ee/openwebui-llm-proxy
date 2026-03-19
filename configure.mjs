@@ -11,38 +11,42 @@ const DEFAULTS = {
   claude: {
     thinking: true,
     toolDisplay: true,
+    toolBodyDisplay: false,
     debugLog: false,
     effort: 'high',
   },
   codex: {
     reasoning: true,
     toolDisplay: true,
+    toolBodyDisplay: false,
     summary: 'detailed',
   },
 };
 
 const PRESETS = {
   fast: {
-    claude: { thinking: false, toolDisplay: false, debugLog: false },
-    codex: { reasoning: false, toolDisplay: false },
+    claude: { thinking: false, toolDisplay: false, toolBodyDisplay: false, debugLog: false },
+    codex: { reasoning: false, toolDisplay: false, toolBodyDisplay: false },
   },
   balanced: {
-    claude: { thinking: false, toolDisplay: true, debugLog: false },
-    codex: { reasoning: false, toolDisplay: true },
+    claude: { thinking: false, toolDisplay: true, toolBodyDisplay: false, debugLog: false },
+    codex: { reasoning: false, toolDisplay: true, toolBodyDisplay: false },
   },
   verbose: {
-    claude: { thinking: true, toolDisplay: true, debugLog: false },
-    codex: { reasoning: true, toolDisplay: true },
+    claude: { thinking: true, toolDisplay: true, toolBodyDisplay: true, debugLog: false },
+    codex: { reasoning: true, toolDisplay: true, toolBodyDisplay: true },
   },
 };
 
 const SETTERS = {
   'claude.thinking': 'boolean',
   'claude.toolDisplay': 'boolean',
+  'claude.toolBodyDisplay': 'boolean',
   'claude.debugLog': 'boolean',
   'claude.effort': ['low', 'medium', 'high'],
   'codex.reasoning': 'boolean',
   'codex.toolDisplay': 'boolean',
+  'codex.toolBodyDisplay': 'boolean',
   'codex.summary': 'string',
 };
 
@@ -105,6 +109,7 @@ function usage(code = 0) {
     '  node configure.mjs fast',
     '  node configure.mjs set claude.thinking off',
     '  node configure.mjs set codex.toolDisplay on',
+    '  node configure.mjs set codex.toolBodyDisplay off',
     '  node configure.mjs set claude.effort medium',
   ];
   const out = lines.join('\n');

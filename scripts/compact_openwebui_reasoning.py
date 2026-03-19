@@ -384,8 +384,8 @@ def main() -> int:
     parser.add_argument(
         "--keep-last-assistant",
         type=int,
-        default=2,
-        help="Number of latest assistant turns to keep reasoning for per chat (default: 2)",
+        default=1,
+        help="Number of latest assistant turns to keep reasoning/tool blocks for per chat (default: 1)",
     )
     parser.add_argument(
         "--apply",

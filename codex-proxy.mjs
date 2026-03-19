@@ -24,6 +24,7 @@ const DEFAULT_CONFIG = {
   codex: {
     reasoning: true,
     toolDisplay: true,
+    toolBodyDisplay: false,
     summary: 'detailed',
   },
 };
@@ -515,6 +516,27 @@ function formatCodeBlock(body, language = '') {
   return `${fence}${info}\n${normalized}\n${fence}`;
 }
 
+function formatInlineLabel(text) {
+  const normalized = String(text || '')
+    .replace(/\r\n/g, '\n')
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .join(' ')
+    .trim();
+  if (!normalized) return '';
+
+  const maxChars = 120;
+  const truncated = normalized.length > maxChars
+    ? `${normalized.slice(0, 72)}...${normalized.slice(-(maxChars - 75))}`
+    : normalized;
+
+  const matches = truncated.match(/`+/g) || [];
+  const longest = matches.reduce((max, run) => Math.max(max, run.length), 0);
+  const fence = '`'.repeat(Math.max(1, longest + 1));
+  return `${fence}${truncated}${fence}`;
+}
+
 function renderArtifactTag(tagName, attrs, body) {
   const normalized = trimBoundaryNewlines(body);
   if (!normalized) return '';
@@ -719,8 +741,10 @@ function truncateDisplayText(text, maxChars = 1200, maxLines = 40) {
 
 function formatToolBlock(title, body = '') {
   const safeBody = truncateDisplayText(body);
-  if (!safeBody) return `\n\n**[${title}]**\n\n`;
-  return `\n\n**[${title}]**\n\n${formatCodeBlock(safeBody)}\n\n`;
+  const label = formatInlineLabel(title);
+  if (!label) return '';
+  if (!safeBody) return `\n\n${label}\n\n`;
+  return `\n\n${label}\n\n${formatCodeBlock(safeBody)}\n\n`;
 }
 
 function summarizeMcpResult(result) {
@@ -741,31 +765,33 @@ function summarizeMcpResult(result) {
   }
 }
 
-function summarizeToolItem(item) {
+function summarizeToolItem(item, options = {}) {
   if (!item || typeof item !== 'object') return '';
+  const showBody = options.showBody === true;
 
   if (item.type === 'commandExecution') {
-    const header = typeof item.exitCode === 'number'
-      ? `Command: ${item.command} (exit ${item.exitCode})`
-      : `Command: ${item.command}`;
-    return formatToolBlock(header, item.aggregatedOutput || '');
+    const exitSuffix = typeof item.exitCode === 'number' && item.exitCode !== 0
+      ? ` (exit ${item.exitCode})`
+      : '';
+    const header = `${item.command || 'command'}${exitSuffix}`;
+    return formatToolBlock(header, showBody ? (item.aggregatedOutput || '') : '');
   }
 
   if (item.type === 'fileChange') {
     const count = Array.isArray(item.changes) ? item.changes.length : 0;
-    return `\n\n> **[Patch]** ${count} file change${count === 1 ? '' : 's'} applied.\n\n`;
+    return `\n\n${formatInlineLabel(`[patch] ${count} file change${count === 1 ? '' : 's'} applied`)}\n\n`;
   }
 
   if (item.type === 'mcpToolCall') {
-    const header = `MCP: ${item.server}/${item.tool}${item.error ? ' (error)' : ''}`;
+    const header = `[mcp] ${item.server}/${item.tool}${item.error ? ' (error)' : ''}`;
     const body = item.error
       ? JSON.stringify(item.error, null, 2)
       : summarizeMcpResult(item.result);
-    return formatToolBlock(header, body);
+    return formatToolBlock(header, showBody ? body : '');
   }
 
   if (item.type === 'collabAgentToolCall') {
-    return `\n\n> **[Agent Tool]** ${item.tool}\n\n`;
+    return `\n\n${formatInlineLabel(`[agent] ${item.tool}`)}\n\n`;
   }
 
   return '';
@@ -1050,7 +1076,9 @@ const server = http.createServer(async (req, res) => {
                 }
 
                 if (cfg.toolDisplay && msg.method === 'item/completed') {
-                  const toolSummary = summarizeToolItem(p.item);
+                  const toolSummary = summarizeToolItem(p.item, {
+                    showBody: cfg.toolBodyDisplay === true,
+                  });
                   if (toolSummary) sendChunk('content', toolSummary);
                 }
 

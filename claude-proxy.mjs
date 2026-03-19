@@ -28,6 +28,7 @@ const DEFAULT_CONFIG = {
   claude: {
     thinking: true,
     toolDisplay: true,
+    toolBodyDisplay: false,
     debugLog: false,
     effort: 'high',
   },
@@ -249,10 +250,33 @@ function formatCodeBlock(body, language = '') {
   return `${fence}${info}\n${normalized}\n${fence}`;
 }
 
+function formatInlineLabel(text) {
+  const normalized = String(text || '')
+    .replace(/\r\n/g, '\n')
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .join(' ')
+    .trim();
+  if (!normalized) return '';
+
+  const maxChars = 120;
+  const truncated = normalized.length > maxChars
+    ? `${normalized.slice(0, 72)}...${normalized.slice(-(maxChars - 75))}`
+    : normalized;
+
+  const matches = truncated.match(/`+/g) || [];
+  const longest = matches.reduce((max, run) => Math.max(max, run.length), 0);
+  const fence = '`'.repeat(Math.max(1, longest + 1));
+  return `${fence}${truncated}${fence}`;
+}
+
 function formatDisplayBlock(title, body = '', language = '') {
   const normalized = trimBoundaryNewlines(body);
-  if (!normalized) return `\n\n**[${title}]**\n\n`;
-  return `\n\n**[${title}]**\n\n${formatCodeBlock(normalized, language)}\n\n`;
+  const label = formatInlineLabel(title);
+  if (!label) return '';
+  if (!normalized) return `\n\n${label}\n\n`;
+  return `\n\n${label}\n\n${formatCodeBlock(normalized, language)}\n\n`;
 }
 
 async function handleChatCompletion(json, req, res) {
@@ -384,7 +408,7 @@ async function handleChatCompletion(json, req, res) {
             if (ev.type === 'content_block_start') {
               const cb = ev.content_block || {};
               if (cb.type === 'tool_use' && cb.name && cfg.toolDisplay) {
-                sendChunk('content', `\n\n**[Tool: ${cb.name}]**\n\n`);
+                sendChunk('content', `\n\n${formatInlineLabel(`[tool] ${cb.name}`)}\n\n`);
               }
             } else if (ev.type === 'content_block_delta') {
               const delta = ev.delta || {};
@@ -407,12 +431,12 @@ async function handleChatCompletion(json, req, res) {
           if (event.type === 'assistant' && event.message?.content) {
             for (const block of event.message.content) {
               if (block.type === 'tool_use') {
-                if (cfg.toolDisplay) {
+                if (cfg.toolDisplay && cfg.toolBodyDisplay === true) {
                   const inputStr = JSON.stringify(block.input || {});
                   const display = inputStr.length > 200
                     ? inputStr.slice(0, 200) + '...'
                     : inputStr;
-                  sendChunk('content', formatDisplayBlock(`Tool: ${block.name || 'input'}`, display, 'json'));
+                  sendChunk('content', formatDisplayBlock(`[tool] ${block.name || 'input'}`, display, 'json'));
                 }
               } else if ((block.type === 'thinking' || block.type === 'reasoning' || block.type === 'reasoning_content') && !sawReasoningDelta) {
                 const thinkingText = block.thinking || block.text || '';
@@ -440,9 +464,9 @@ async function handleChatCompletion(json, req, res) {
                   ? output.slice(0, 500) + '\n... (truncated)'
                   : output;
                 if (block.is_error) {
-                  sendChunk('content', formatDisplayBlock('Error', truncated));
+                  sendChunk('content', formatDisplayBlock('[error]', cfg.toolBodyDisplay === true ? truncated : ''));
                 } else {
-                  sendChunk('content', formatDisplayBlock('Tool Result', truncated));
+                  sendChunk('content', formatDisplayBlock('[result]', cfg.toolBodyDisplay === true ? truncated : ''));
                 }
               }
             }
