@@ -135,6 +135,8 @@ class CodexClient {
     this.nextId = 1;
     this.pending = new Map();
     this.notifications = [];
+    this.nextNotificationSeq = 1;
+    this.notificationCursors = new Map();
     this.proc = null;
     this.rl = null;
     this.ready = false;
@@ -142,6 +144,7 @@ class CodexClient {
     this.startPromise = null;
     this.restartPromise = null;
     this.expectedExitPids = new Set();
+    this.lastFailure = null;
   }
 
   async start() {
@@ -149,6 +152,7 @@ class CodexClient {
     if (this.startPromise) return this.startPromise;
 
     this.startPromise = (async () => {
+      this.lastFailure = null;
       const proc = spawn(CODEX_BIN, ['app-server'], {
         stdio: ['pipe', 'pipe', 'inherit'],
         cwd: CODEX_CWD,
@@ -158,6 +162,8 @@ class CodexClient {
 
       proc.on('exit', (code, signal) => {
         const expected = this.expectedExitPids.delete(proc.pid);
+        const failureMessage = `codex exited: ${signal || code}`;
+        this.lastFailure = new Error(failureMessage);
         if (!expected) {
           console.error(`[codex] exited: ${signal || code}`);
         }
@@ -173,6 +179,8 @@ class CodexClient {
           reject(new Error('codex exited'));
         }
         this.pending.clear();
+        this.notifications = [];
+        this.notificationCursors.clear();
       });
 
       this.rl = createInterface({ input: proc.stdout });
@@ -225,6 +233,9 @@ class CodexClient {
       reject(new Error(reason));
     }
     this.pending.clear();
+    this.notifications = [];
+    this.notificationCursors.clear();
+    this.lastFailure = new Error(reason);
 
     if (!proc || proc.exitCode !== null) return;
 
@@ -301,13 +312,69 @@ class CodexClient {
         console.log(`[codex notification] ${msg.method}${extra}`);
       }
     }
-    this.notifications.push(msg);
+    this.notifications.push({ seq: this.nextNotificationSeq++, msg });
   }
 
-  drainNotifications() {
-    const n = this.notifications;
-    this.notifications = [];
-    return n;
+  isAlive() {
+    return Boolean(this.proc && this.proc.exitCode === null);
+  }
+
+  createNotificationCursor({ includeBuffered = false } = {}) {
+    const id = randomUUID();
+    const startSeq = includeBuffered && this.notifications.length > 0
+      ? this.notifications[0].seq
+      : this.nextNotificationSeq;
+    this.notificationCursors.set(id, startSeq);
+    return id;
+  }
+
+  readCursorNotifications(cursorId) {
+    const nextSeq = this.notificationCursors.get(cursorId);
+    if (typeof nextSeq !== 'number') return [];
+
+    const notifications = [];
+    let lastSeq = nextSeq;
+    for (const entry of this.notifications) {
+      if (entry.seq < nextSeq) continue;
+      notifications.push(entry.msg);
+      lastSeq = entry.seq + 1;
+    }
+
+    if (notifications.length > 0) {
+      this.notificationCursors.set(cursorId, lastSeq);
+    }
+
+    this.pruneNotifications();
+    return notifications;
+  }
+
+  closeNotificationCursor(cursorId) {
+    if (!cursorId) return;
+    this.notificationCursors.delete(cursorId);
+    this.pruneNotifications();
+  }
+
+  pruneNotifications() {
+    if (this.notifications.length === 0) return;
+
+    if (this.notificationCursors.size === 0) {
+      this.notifications = [];
+      return;
+    }
+
+    let minSeq = Infinity;
+    for (const seq of this.notificationCursors.values()) {
+      if (seq < minSeq) minSeq = seq;
+    }
+    if (!Number.isFinite(minSeq)) return;
+
+    let cutIndex = 0;
+    while (cutIndex < this.notifications.length && this.notifications[cutIndex].seq < minSeq) {
+      cutIndex++;
+    }
+    if (cutIndex > 0) {
+      this.notifications = this.notifications.slice(cutIndex);
+    }
   }
 }
 
@@ -706,7 +773,7 @@ function summarizeToolItem(item) {
 
 function maybeScheduleCodexRestart(message, { force = false } = {}) {
   const text = String(message || '');
-  if (!force && !/401 Unauthorized|Missing bearer or basic authentication|timeout waiting for turn\/completed|timed out waiting for codex turn completion|stream disconnected before completion|codex exited|client disconnected/i.test(text)) return;
+  if (!force && !/401 Unauthorized|Missing bearer or basic authentication|timeout waiting for turn\/completed|timed out waiting for codex turn completion|stream disconnected before completion|codex exited/i.test(text)) return;
   setTimeout(() => {
     codex.restart(text || 'scheduled recovery').catch((err) => {
       console.error('[codex] restart failed after recovery trigger:', err.message);
@@ -715,27 +782,35 @@ function maybeScheduleCodexRestart(message, { force = false } = {}) {
 }
 
 // ── Wait for turn completion or terminal error ──
-function waitForTurnOutcome(client, turnId, timeoutMs = 600_000) {
+function waitForTurnOutcome(client, turnId, cursorId, timeoutMs = 600_000) {
   return new Promise((resolve, reject) => {
     const start = Date.now();
+    const turnNotifications = [];
     const interval = setInterval(() => {
-      const turnNotifications = client.notifications.filter((msg) => notificationMatchesTurn(msg, turnId));
-      const terminalError = turnNotifications.find((msg) => msg.method === 'error' && msg.params?.willRetry === false);
-      if (terminalError) {
+      if (!client.isAlive()) {
         clearInterval(interval);
-        const message = terminalError.params?.error?.message || 'Codex turn failed';
-        maybeScheduleCodexRestart(message);
-        reject(new Error(message));
+        reject(client.lastFailure || new Error('codex exited'));
         return;
       }
 
-      const completed = turnNotifications.find((msg) => {
-        return msg.method === 'turn/completed' && msg.params?.turn?.id === turnId;
-      });
-      if (completed) {
-        clearInterval(interval);
-        resolve(completed);
-        return;
+      const notifications = client.readCursorNotifications(cursorId);
+      for (const msg of notifications) {
+        if (!notificationMatchesTurn(msg, turnId)) continue;
+        turnNotifications.push(msg);
+
+        if (msg.method === 'error' && msg.params?.willRetry === false) {
+          clearInterval(interval);
+          const message = msg.params?.error?.message || 'Codex turn failed';
+          maybeScheduleCodexRestart(message);
+          reject(new Error(message));
+          return;
+        }
+
+        if (msg.method === 'turn/completed' && msg.params?.turn?.id === turnId) {
+          clearInterval(interval);
+          resolve(turnNotifications);
+          return;
+        }
       }
 
       if (Date.now() - start > timeoutMs) {
@@ -745,33 +820,6 @@ function waitForTurnOutcome(client, turnId, timeoutMs = 600_000) {
       }
     }, 50);
   });
-}
-
-// ── Request Queue — serialize concurrent requests to avoid notification cross-talk ──
-const requestQueue = [];
-let requestProcessing = false;
-
-function enqueue(fn) {
-  return new Promise((resolve, reject) => {
-    requestQueue.push({ fn, resolve, reject });
-    processQueue();
-  });
-}
-
-async function processQueue() {
-  if (requestProcessing) return;
-  const item = requestQueue.shift();
-  if (!item) return;
-  requestProcessing = true;
-  try {
-    const result = await item.fn();
-    item.resolve(result);
-  } catch (err) {
-    item.reject(err);
-  } finally {
-    requestProcessing = false;
-    processQueue();
-  }
 }
 
 async function startThread(client, model, developerInstructions) {
@@ -835,135 +883,133 @@ const server = http.createServer(async (req, res) => {
       }
       const { inputParts, systemPrompt } = builtInput;
 
-      // Serialize requests — prevents notification cross-talk between concurrent turns
-      await enqueue(() => new Promise((qResolve, qReject) => {
-        (async () => {
-        try {
-          await codex.ensureReady();
-          codex.drainNotifications();
-          const cfg = getCodexConfig();
+      await codex.ensureReady();
+      const cfg = getCodexConfig();
+      const threadId = await startThread(codex, model, systemPrompt);
+      const summaryMode = cfg.reasoning ? (cfg.summary || 'detailed') : 'none';
+      const notificationCursor = codex.createNotificationCursor();
 
-          const threadId = await startThread(codex, model, systemPrompt);
-          const summaryMode = cfg.reasoning ? (cfg.summary || 'detailed') : 'none';
-          const turnResult = await codex.request('turn/start', {
-            threadId,
-            input: inputParts,
-            model,
-            summary: summaryMode,
+      try {
+        const turnResult = await codex.request('turn/start', {
+          threadId,
+          input: inputParts,
+          model,
+          summary: summaryMode,
+        });
+        const turnId = turnResult.turn?.id;
+
+        if (stream) {
+          res.writeHead(200, {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
           });
-          const turnId = turnResult.turn?.id;
 
-          if (stream) {
-            res.writeHead(200, {
-              'Content-Type': 'text/event-stream',
-              'Cache-Control': 'no-cache',
-              'Connection': 'keep-alive',
-            });
+          const chatId = `chatcmpl-${randomUUID().slice(0, 8)}`;
+          const tagFilter = new TagFilter();
+          let agentMsgBuffer = [];
+          let hadCommand = false;
+          let agentMsgCount = 0;
+          let sentRole = false;
+          let clientDisconnected = false;
+          let settled = false;
+          let interval = null;
+          let safetyTimeout = null;
 
-            const chatId = `chatcmpl-${randomUUID().slice(0, 8)}`;
-            let seenIdx = 0;
-            const tagFilter = new TagFilter();
-            let agentMsgBuffer = [];
-            let hadCommand = false;
-            let agentMsgCount = 0;
-            let sentRole = false;
-            let clientDisconnected = false;
-            let settled = false;
-            let interval = null;
-            let safetyTimeout = null;
+          function sendChunk(field, text) {
+            if (!text || res.writableEnded) return;
+            const delta = { [field]: text };
+            if (!sentRole) {
+              delta.role = 'assistant';
+              sentRole = true;
+            }
+            const chunk = {
+              id: chatId, object: 'chat.completion.chunk',
+              created: Math.floor(Date.now() / 1000), model,
+              choices: [{ index: 0, delta, finish_reason: null }],
+            };
+            res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+          }
 
-            function sendChunk(field, text) {
-              if (!text || res.writableEnded) return;
-              const delta = { [field]: text };
-              if (!sentRole) {
-                delta.role = 'assistant';
-                sentRole = true;
-              }
-              const chunk = {
+          function flushBuffer(field) {
+            const text = stripArtifactTags(agentMsgBuffer.join(''));
+            if (text.trim()) sendChunk(field, text);
+            agentMsgBuffer = [];
+          }
+
+          function flushAgentContent(fallbackText = '') {
+            const trailing = tagFilter.flush();
+            if (trailing) agentMsgBuffer.push(trailing);
+            const bufferedText = stripArtifactTags(agentMsgBuffer.join('')).trim();
+            const fallback = stripArtifactTags(fallbackText).trim();
+            const text = bufferedText || fallback;
+            if (text) sendChunk('content', text);
+            agentMsgBuffer = [];
+          }
+
+          function cleanupStream() {
+            clearInterval(interval);
+            clearInterval(keepalive);
+            clearTimeout(safetyTimeout);
+            codex.closeNotificationCursor(notificationCursor);
+          }
+
+          function finishStream() {
+            if (settled) return;
+            settled = true;
+            cleanupStream();
+            if (!res.writableEnded) {
+              const endChunk = {
                 id: chatId, object: 'chat.completion.chunk',
                 created: Math.floor(Date.now() / 1000), model,
-                choices: [{ index: 0, delta, finish_reason: null }],
+                choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
               };
-              res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+              res.write(`data: ${JSON.stringify(endChunk)}\n\n`);
+              res.write('data: [DONE]\n\n');
+              res.end();
             }
+          }
 
-            function flushBuffer(field) {
-              const text = stripArtifactTags(agentMsgBuffer.join(''));
-              if (text.trim()) sendChunk(field, text);
-              agentMsgBuffer = [];
+          function finishStreamWithError(message) {
+            if (settled) return;
+            settled = true;
+            cleanupStream();
+            maybeScheduleCodexRestart(message);
+            if (!res.writableEnded) {
+              if (message) sendChunk('content', `Error: ${message}`);
+              const endChunk = {
+                id: chatId, object: 'chat.completion.chunk',
+                created: Math.floor(Date.now() / 1000), model,
+                choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+              };
+              res.write(`data: ${JSON.stringify(endChunk)}\n\n`);
+              res.write('data: [DONE]\n\n');
+              res.end();
             }
+          }
 
-            function flushAgentContent(fallbackText = '') {
-              const trailing = tagFilter.flush();
-              if (trailing) agentMsgBuffer.push(trailing);
-              const bufferedText = stripArtifactTags(agentMsgBuffer.join('')).trim();
-              const fallback = stripArtifactTags(fallbackText).trim();
-              const text = bufferedText || fallback;
-              if (text) sendChunk('content', text);
-              agentMsgBuffer = [];
-            }
+          const keepalive = setInterval(() => {
+            if (!res.writableEnded) res.write(': keepalive\n\n');
+          }, 15000);
 
-            function finishStream() {
-              if (settled) return;
-              settled = true;
-              clearInterval(interval);
-              clearInterval(keepalive);
-              clearTimeout(safetyTimeout);
-              if (!res.writableEnded) {
-                const endChunk = {
-                  id: chatId, object: 'chat.completion.chunk',
-                  created: Math.floor(Date.now() / 1000), model,
-                  choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
-                };
-                res.write(`data: ${JSON.stringify(endChunk)}\n\n`);
-                res.write('data: [DONE]\n\n');
-                res.end();
+          req.on('close', () => {
+            if (res.writableEnded || settled) return;
+            clientDisconnected = true;
+            cleanupStream();
+            console.log(`[codex] client disconnected for turn ${turnId}`);
+          });
+
+          interval = setInterval(() => {
+            if (clientDisconnected || settled) return;
+
+            try {
+              if (!codex.isAlive()) {
+                finishStreamWithError(codex.lastFailure?.message || 'codex exited');
+                return;
               }
-              qResolve();
-            }
 
-            function finishStreamWithError(message) {
-              if (settled) return;
-              settled = true;
-              clearInterval(interval);
-              clearInterval(keepalive);
-              clearTimeout(safetyTimeout);
-              maybeScheduleCodexRestart(message);
-              if (!res.writableEnded) {
-                if (message) sendChunk('content', `Error: ${message}`);
-                const endChunk = {
-                  id: chatId, object: 'chat.completion.chunk',
-                  created: Math.floor(Date.now() / 1000), model,
-                  choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
-                };
-                res.write(`data: ${JSON.stringify(endChunk)}\n\n`);
-                res.write('data: [DONE]\n\n');
-                res.end();
-              }
-              qResolve();
-            }
-
-            const keepalive = setInterval(() => {
-              if (!res.writableEnded) res.write(': keepalive\n\n');
-            }, 15000);
-
-            req.on('close', () => {
-              if (res.writableEnded || settled) return;
-              clientDisconnected = true;
-              clearInterval(interval);
-              clearInterval(keepalive);
-              clearTimeout(safetyTimeout);
-              console.log('[codex] client disconnected');
-              maybeScheduleCodexRestart('client disconnected', { force: true });
-              qResolve();
-            });
-
-            interval = setInterval(() => {
-              if (clientDisconnected || settled) return;
-              const notifications = codex.notifications;
-              for (let i = seenIdx; i < notifications.length; i++) {
-                const msg = notifications[i];
-                seenIdx = i + 1;
+              const notifications = codex.readCursorNotifications(notificationCursor);
+              for (const msg of notifications) {
                 if (!notificationMatchesTurn(msg, turnId)) continue;
 
                 const p = msg.params ?? {};
@@ -1033,35 +1079,36 @@ const server = http.createServer(async (req, res) => {
                   return;
                 }
               }
-            }, 50);
+            } catch (err) {
+              finishStreamWithError(err?.message || 'Codex stream failed');
+            }
+          }, 50);
 
-            safetyTimeout = setTimeout(() => {
-              finishStreamWithError('timeout waiting for turn/completed');
-            }, 600_000);
-
-          } else {
-	            await waitForTurnOutcome(codex, turnId);
-	            const turnNotifications = codex.notifications.filter((msg) => notificationMatchesTurn(msg, turnId));
-	            const text = extractAgentMessageDeltaText(turnNotifications)
-	              || extractCompletedAgentText(turnNotifications)
-	              || extractText(turnNotifications).trim();
-	            const response = {
-              id: `chatcmpl-${randomUUID().slice(0, 8)}`,
-              object: 'chat.completion',
-              created: Math.floor(Date.now() / 1000), model,
-              choices: [{ index: 0, message: { role: 'assistant', content: text }, finish_reason: 'stop' }],
-              usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-            };
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify(response));
-            qResolve();
-          }
-        } catch (err) {
-          maybeScheduleCodexRestart(err?.message || '');
-          qReject(err);
+          safetyTimeout = setTimeout(() => {
+            finishStreamWithError('timeout waiting for turn/completed');
+          }, 600_000);
+          return;
         }
-        })();
-      }));
+
+        const turnNotifications = await waitForTurnOutcome(codex, turnId, notificationCursor);
+        const text = extractAgentMessageDeltaText(turnNotifications)
+          || extractCompletedAgentText(turnNotifications)
+          || extractText(turnNotifications).trim();
+        const response = {
+          id: `chatcmpl-${randomUUID().slice(0, 8)}`,
+          object: 'chat.completion',
+          created: Math.floor(Date.now() / 1000), model,
+          choices: [{ index: 0, message: { role: 'assistant', content: text }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+        };
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(response));
+        codex.closeNotificationCursor(notificationCursor);
+      } catch (err) {
+        codex.closeNotificationCursor(notificationCursor);
+        maybeScheduleCodexRestart(err?.message || '');
+        throw err;
+      }
       return;
     }
 
