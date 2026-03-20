@@ -40,6 +40,31 @@ services:
       - ./data:/data
       - fastembed-cache:/root/.cache/fastembed
 
+  # ── Local File Viewer (admin-only, same-origin via nginx) ──
+  local-file-viewer:
+    build:
+      context: ./local-file-viewer
+      dockerfile: Dockerfile
+    container_name: local-file-viewer
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8301:8000"
+    environment:
+      OPENWEBUI_AUTH_URL: "http://open-webui:8080/api/v1/auths/"
+      OPENCLAW_WORKSPACE_DIR: "${OPENCLAW_WORKSPACE_DIR:-/absolute/path/to/your/openclaw/workspace}"
+      LOCAL_FILE_URL_PREFIX: "${LOCAL_FILE_URL_PREFIX:-/absolute/path/to/your/openclaw/workspace}"
+      LOCAL_FILE_MOUNT_ROOT: "/workspace-host"
+      LOCAL_FILE_SIGNING_KEY_FILE: "/llm-proxy/.local-file-signing.key"
+      LOCAL_FILE_REQUIRE_ADMIN: "${LOCAL_FILE_REQUIRE_ADMIN:-true}"
+      LOCAL_FILE_MAX_INLINE_BYTES: "${LOCAL_FILE_MAX_INLINE_BYTES:-1048576}"
+      LOCAL_FILE_AUTH_TIMEOUT_SECONDS: "${LOCAL_FILE_AUTH_TIMEOUT_SECONDS:-5}"
+      LOCAL_FILE_LINK_TTL_SECONDS: "${LOCAL_FILE_LINK_TTL_SECONDS:-2592000}"
+    volumes:
+      - ${OPENCLAW_WORKSPACE_DIR:-/absolute/path/to/your/openclaw/workspace}:/workspace-host:ro
+      - ./llm-proxy:/llm-proxy:ro
+    depends_on:
+      - open-webui
+
   # ── OpenWebUI ──
   open-webui:
     image: ghcr.io/open-webui/open-webui:main
@@ -50,6 +75,8 @@ services:
     environment:
       WEBUI_AUTH: "true"
       ENABLE_SIGNUP: "true"
+      LOCAL_FILE_VIEWER_INTERNAL_URL: "http://local-file-viewer:8000"
+      LOCAL_FILE_PROXY_TIMEOUT_SECONDS: "30"
       # Codex proxy (맥 로컬 :8200)
       OPENAI_API_BASE_URLS: "http://host.docker.internal:8200/v1;http://host.docker.internal:8201/v1"
       OPENAI_API_KEYS: "dummy-codex;dummy-claude"
@@ -64,6 +91,7 @@ services:
         - After the interpreter output, continue with a normal chat response outside the XML tags and do not end the user-facing answer as only a code block.
     volumes:
       - open-webui-data:/app/backend/data
+      - ./open-webui-runtime-patches/main.py:/app/backend/open_webui/main.py:ro
       - ./open-webui-runtime-patches/middleware.py:/app/backend/open_webui/utils/middleware.py:ro
     depends_on:
       - tool-api

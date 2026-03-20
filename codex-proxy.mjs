@@ -13,7 +13,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync, spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
-import { randomUUID } from 'node:crypto';
+import { createHmac, randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -61,6 +61,26 @@ const PORT = parseInt(process.env.CODEX_PROXY_PORT || '8200');
 const CODEX_BIN = process.env.CODEX_BIN || 'codex';
 const CODEX_MODEL = process.env.CODEX_MODEL || 'gpt-5.4';
 const CODEX_CWD = process.env.CODEX_CWD || new URL('.', import.meta.url).pathname.replace(/\/llm-proxy\/$/, '/codex-sandbox');
+const LOCAL_FILE_VIEWER_BASE_URL = String(process.env.LOCAL_FILE_VIEWER_BASE_URL || 'https://ai.smlee.io').replace(/\/+$/, '');
+const LOCAL_FILE_PATH_PREFIX = String(
+  process.env.LOCAL_FILE_PATH_PREFIX
+  || process.env.OPENCLAW_WORKSPACE_DIR
+  || '/Users/bugclaw/.openclaw/workspace'
+).replace(/\/+$/, '');
+const LOCAL_FILE_SIGNING_KEY_FILE = process.env.LOCAL_FILE_SIGNING_KEY_FILE || path.join(__dirname, '.local-file-signing.key');
+const LOCAL_FILE_LINK_TTL_SECONDS = parseInt(process.env.LOCAL_FILE_LINK_TTL_SECONDS || String(60 * 60 * 24 * 30), 10);
+
+function loadLocalFileSigningKey() {
+  const envValue = String(process.env.LOCAL_FILE_SIGNING_KEY || '').trim();
+  if (envValue) return envValue;
+  try {
+    return fs.readFileSync(LOCAL_FILE_SIGNING_KEY_FILE, 'utf8').trim();
+  } catch {
+    return '';
+  }
+}
+
+const LOCAL_FILE_SIGNING_KEY = loadLocalFileSigningKey();
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -537,6 +557,105 @@ function formatInlineLabel(text) {
   return `${fence}${truncated}${fence}`;
 }
 
+function normalizeDisplayLabel(text) {
+  return String(text || '')
+    .replace(/\r\n/g, '\n')
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .join(' ')
+    .trim()
+    .slice(0, 120)
+    .replace(/(.{72}).+(.{24})$/, '$1...$2');
+}
+
+function escapeHtml(text) {
+  return String(text || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+function parseLocalFileTarget(href) {
+  const raw = String(href || '').trim();
+  if (!raw) return null;
+  if (raw.includes('/local-file/t/')) return null;
+
+  const extract = (value, hash = '') => {
+    if (!value.startsWith(LOCAL_FILE_PATH_PREFIX)) return null;
+    const relativePath = decodeURIComponent(value.slice(LOCAL_FILE_PATH_PREFIX.length).replace(/^\/+/, ''));
+    if (!relativePath) return null;
+    return { relativePath, hash };
+  };
+
+  if (raw.startsWith(LOCAL_FILE_PATH_PREFIX)) {
+    const [pathname, hash = ''] = raw.split('#', 2);
+    return extract(pathname, hash ? `#${hash}` : '');
+  }
+
+  try {
+    const parsed = new URL(raw);
+    return extract(parsed.pathname, parsed.hash || '');
+  } catch {
+    return null;
+  }
+}
+
+function signLocalFileTarget(relativePath) {
+  if (!LOCAL_FILE_SIGNING_KEY) return '';
+  const payload = {
+    path: String(relativePath || '').replace(/^\/+/, ''),
+    exp: Math.floor(Date.now() / 1000) + LOCAL_FILE_LINK_TTL_SECONDS,
+  };
+  const encodedPayload = Buffer.from(JSON.stringify(payload)).toString('base64url');
+  const signature = createHmac('sha256', LOCAL_FILE_SIGNING_KEY)
+    .update(encodedPayload)
+    .digest('base64url');
+  return `${encodedPayload}.${signature}`;
+}
+
+function normalizeLocalFileHref(href) {
+  const target = parseLocalFileTarget(href);
+  if (!target) return '';
+
+  const signed = signLocalFileTarget(target.relativePath);
+  if (!signed) {
+    return `${LOCAL_FILE_VIEWER_BASE_URL}${LOCAL_FILE_PATH_PREFIX}/${target.relativePath}${target.hash}`;
+  }
+
+  return `${LOCAL_FILE_VIEWER_BASE_URL}/local-file/t/${signed}${target.hash}`;
+}
+
+function rewriteLocalFileLinks(text) {
+  const input = String(text || '');
+  if (!input || !input.includes(LOCAL_FILE_PATH_PREFIX)) return input;
+
+  return input.replace(/\]\(([^)\s]+)\)/g, (match, href) => {
+    const rewritten = normalizeLocalFileHref(href);
+    return rewritten ? `](${rewritten})` : match;
+  });
+}
+
+function splitTrailingPartialMarkdownLink(text) {
+  const lastOpen = text.lastIndexOf('](');
+  if (lastOpen !== -1) {
+    const lastClose = text.lastIndexOf(')');
+    if (lastClose > lastOpen) {
+      return { safe: text, remainder: '' };
+    }
+    if (lastClose <= lastOpen) {
+      const tail = text.slice(lastOpen);
+      if (tail.length <= 4096) {
+        return { safe: text.slice(0, lastOpen), remainder: tail };
+      }
+    }
+  }
+
+  const lookbehind = 8;
+  if (text.length <= lookbehind) return { safe: '', remainder: text };
+  return { safe: text.slice(0, -lookbehind), remainder: text.slice(-lookbehind) };
+}
+
 function renderArtifactTag(tagName, attrs, body) {
   const normalized = trimBoundaryNewlines(body);
   if (!normalized) return '';
@@ -638,6 +757,39 @@ class TagFilter {
   }
 }
 
+class LocalFileLinkFilter {
+  constructor() {
+    this.buffer = '';
+  }
+
+  filter(delta) {
+    if (!delta) return '';
+    this.buffer += delta;
+    return this._drain(false);
+  }
+
+  flush() {
+    if (!this.buffer) return '';
+    return this._drain(true);
+  }
+
+  reset() {
+    this.buffer = '';
+  }
+
+  _drain(flushAll) {
+    if (flushAll) {
+      const output = rewriteLocalFileLinks(this.buffer);
+      this.buffer = '';
+      return output;
+    }
+
+    const { safe, remainder } = splitTrailingPartialMarkdownLink(this.buffer);
+    this.buffer = remainder;
+    return rewriteLocalFileLinks(safe);
+  }
+}
+
 // For non-streaming / completed messages: convert XML-ish artifacts to Markdown.
 function stripArtifactTags(text) {
   return text
@@ -662,7 +814,7 @@ function extractText(notifications) {
       }
     }
   }
-  return stripArtifactTags(parts.join(''));
+  return rewriteLocalFileLinks(stripArtifactTags(parts.join('')));
 }
 
 function extractAgentMessageDeltaText(notifications) {
@@ -674,7 +826,7 @@ function extractAgentMessageDeltaText(notifications) {
   function flushCurrent() {
     const trailing = tagFilter.flush();
     if (trailing) current.push(trailing);
-    const cleaned = stripArtifactTags(current.join('')).trim();
+    const cleaned = rewriteLocalFileLinks(stripArtifactTags(current.join(''))).trim();
     if (cleaned) parts.push(cleaned);
     current = [];
     tagFilter.reset();
@@ -712,7 +864,7 @@ function extractCompletedAgentText(notifications) {
   for (const msg of notifications) {
     const item = msg.params?.item;
     if (msg.method !== 'item/completed' || item?.type !== 'agentMessage') continue;
-    const cleaned = stripArtifactTags(item.text || '').trim();
+    const cleaned = rewriteLocalFileLinks(stripArtifactTags(item.text || '')).trim();
     if (cleaned) parts.push(cleaned);
   }
   return parts.join('\n\n').trim();
@@ -741,10 +893,11 @@ function truncateDisplayText(text, maxChars = 1200, maxLines = 40) {
 
 function formatToolBlock(title, body = '') {
   const safeBody = truncateDisplayText(body);
-  const label = formatInlineLabel(title);
-  if (!label) return '';
-  if (!safeBody) return `\n\n${label}\n\n`;
-  return `\n\n${label}\n\n${formatCodeBlock(safeBody)}\n\n`;
+  const summary = normalizeDisplayLabel(title);
+  const prefixedSummary = summary ? `- ${summary}` : '';
+  if (!summary) return '';
+  if (!safeBody) return `\n\n${formatInlineLabel(prefixedSummary)}\n\n`;
+  return `\n\n<details>\n<summary>${escapeHtml(prefixedSummary)}</summary>\n\n${formatCodeBlock(safeBody)}\n\n</details>\n\n`;
 }
 
 function summarizeMcpResult(result) {
@@ -933,6 +1086,7 @@ const server = http.createServer(async (req, res) => {
 
           const chatId = `chatcmpl-${randomUUID().slice(0, 8)}`;
           const tagFilter = new TagFilter();
+          const contentLinkFilter = new LocalFileLinkFilter();
           let agentMsgBuffer = [];
           let hadCommand = false;
           let agentMsgCount = 0;
@@ -942,7 +1096,7 @@ const server = http.createServer(async (req, res) => {
           let interval = null;
           let safetyTimeout = null;
 
-          function sendChunk(field, text) {
+          function writeChunk(field, text) {
             if (!text || res.writableEnded) return;
             const delta = { [field]: text };
             if (!sentRole) {
@@ -955,6 +1109,19 @@ const server = http.createServer(async (req, res) => {
               choices: [{ index: 0, delta, finish_reason: null }],
             };
             res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+          }
+
+          function sendChunk(field, text) {
+            if (!text || res.writableEnded) return;
+            const rewritten = field === 'content'
+              ? contentLinkFilter.filter(text)
+              : text;
+            if (rewritten) writeChunk(field, rewritten);
+          }
+
+          function flushContentLinkBuffer() {
+            const trailing = contentLinkFilter.flush();
+            if (trailing) writeChunk('content', trailing);
           }
 
           function flushBuffer(field) {
@@ -983,6 +1150,7 @@ const server = http.createServer(async (req, res) => {
           function finishStream() {
             if (settled) return;
             settled = true;
+            flushContentLinkBuffer();
             cleanupStream();
             if (!res.writableEnded) {
               const endChunk = {
@@ -999,10 +1167,11 @@ const server = http.createServer(async (req, res) => {
           function finishStreamWithError(message) {
             if (settled) return;
             settled = true;
+            flushContentLinkBuffer();
             cleanupStream();
             maybeScheduleCodexRestart(message);
             if (!res.writableEnded) {
-              if (message) sendChunk('content', `Error: ${message}`);
+              if (message) writeChunk('content', `Error: ${message}`);
               const endChunk = {
                 id: chatId, object: 'chat.completion.chunk',
                 created: Math.floor(Date.now() / 1000), model,

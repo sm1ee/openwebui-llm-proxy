@@ -15,8 +15,12 @@
         <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
         <key>CODEX_CWD</key>
         <string>/PATH/TO/your/workspace</string>
+        <key>OPENCLAW_WORKSPACE_DIR</key>
+        <string>/PATH/TO/your/workspace</string>
         <key>CODEX_MODEL</key>
         <string>gpt-5.4</string>
+        <key>LOCAL_FILE_VIEWER_BASE_URL</key>
+        <string>https://ai.yourdomain.com</string>
         <key>HOME</key>
         <string>/Users/YOURUSERNAME</string>
     </dict>

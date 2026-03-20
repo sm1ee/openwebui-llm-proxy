@@ -1,0 +1,6 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+httpx==0.28.1
+Pygments==2.19.1
+markdown-it-py==3.0.0
+bleach==6.2.0

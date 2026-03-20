@@ -13,7 +13,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { execFileSync, spawn } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { createHmac, randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -22,6 +22,26 @@ const CONFIG_PATH = path.join(__dirname, 'config.json');
 const PORT = parseInt(process.env.CLAUDE_PROXY_PORT || '8201');
 const CLAUDE_BIN = process.env.CLAUDE_BIN || 'claude';
 const CLAUDE_MODEL = process.env.CLAUDE_MODEL || 'sonnet';
+const LOCAL_FILE_VIEWER_BASE_URL = String(process.env.LOCAL_FILE_VIEWER_BASE_URL || 'https://ai.smlee.io').replace(/\/+$/, '');
+const LOCAL_FILE_PATH_PREFIX = String(
+  process.env.LOCAL_FILE_PATH_PREFIX
+  || process.env.OPENCLAW_WORKSPACE_DIR
+  || '/Users/bugclaw/.openclaw/workspace'
+).replace(/\/+$/, '');
+const LOCAL_FILE_SIGNING_KEY_FILE = process.env.LOCAL_FILE_SIGNING_KEY_FILE || path.join(__dirname, '.local-file-signing.key');
+const LOCAL_FILE_LINK_TTL_SECONDS = parseInt(process.env.LOCAL_FILE_LINK_TTL_SECONDS || String(60 * 60 * 24 * 30), 10);
+
+function loadLocalFileSigningKey() {
+  const envValue = String(process.env.LOCAL_FILE_SIGNING_KEY || '').trim();
+  if (envValue) return envValue;
+  try {
+    return fs.readFileSync(LOCAL_FILE_SIGNING_KEY_FILE, 'utf8').trim();
+  } catch {
+    return '';
+  }
+}
+
+const LOCAL_FILE_SIGNING_KEY = loadLocalFileSigningKey();
 
 // ── Config ──
 const DEFAULT_CONFIG = {
@@ -271,12 +291,141 @@ function formatInlineLabel(text) {
   return `${fence}${truncated}${fence}`;
 }
 
+function normalizeDisplayLabel(text) {
+  return String(text || '')
+    .replace(/\r\n/g, '\n')
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .join(' ')
+    .trim()
+    .slice(0, 120)
+    .replace(/(.{72}).+(.{24})$/, '$1...$2');
+}
+
+function escapeHtml(text) {
+  return String(text || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+function parseLocalFileTarget(href) {
+  const raw = String(href || '').trim();
+  if (!raw) return null;
+  if (raw.includes('/local-file/t/')) return null;
+
+  const extract = (value, hash = '') => {
+    if (!value.startsWith(LOCAL_FILE_PATH_PREFIX)) return null;
+    const relativePath = decodeURIComponent(value.slice(LOCAL_FILE_PATH_PREFIX.length).replace(/^\/+/, ''));
+    if (!relativePath) return null;
+    return { relativePath, hash };
+  };
+
+  if (raw.startsWith(LOCAL_FILE_PATH_PREFIX)) {
+    const [pathname, hash = ''] = raw.split('#', 2);
+    return extract(pathname, hash ? `#${hash}` : '');
+  }
+
+  try {
+    const parsed = new URL(raw);
+    return extract(parsed.pathname, parsed.hash || '');
+  } catch {
+    return null;
+  }
+}
+
+function signLocalFileTarget(relativePath) {
+  if (!LOCAL_FILE_SIGNING_KEY) return '';
+  const payload = {
+    path: String(relativePath || '').replace(/^\/+/, ''),
+    exp: Math.floor(Date.now() / 1000) + LOCAL_FILE_LINK_TTL_SECONDS,
+  };
+  const encodedPayload = Buffer.from(JSON.stringify(payload)).toString('base64url');
+  const signature = createHmac('sha256', LOCAL_FILE_SIGNING_KEY)
+    .update(encodedPayload)
+    .digest('base64url');
+  return `${encodedPayload}.${signature}`;
+}
+
+function normalizeLocalFileHref(href) {
+  const target = parseLocalFileTarget(href);
+  if (!target) return '';
+
+  const signed = signLocalFileTarget(target.relativePath);
+  if (!signed) {
+    return `${LOCAL_FILE_VIEWER_BASE_URL}${LOCAL_FILE_PATH_PREFIX}/${target.relativePath}${target.hash}`;
+  }
+
+  return `${LOCAL_FILE_VIEWER_BASE_URL}/local-file/t/${signed}${target.hash}`;
+}
+
+function rewriteLocalFileLinks(text) {
+  const input = String(text || '');
+  if (!input || !input.includes(LOCAL_FILE_PATH_PREFIX)) return input;
+
+  return input.replace(/\]\(([^)\s]+)\)/g, (match, href) => {
+    const rewritten = normalizeLocalFileHref(href);
+    return rewritten ? `](${rewritten})` : match;
+  });
+}
+
+function splitTrailingPartialMarkdownLink(text) {
+  const lastOpen = text.lastIndexOf('](');
+  if (lastOpen !== -1) {
+    const lastClose = text.lastIndexOf(')');
+    if (lastClose > lastOpen) {
+      return { safe: text, remainder: '' };
+    }
+    if (lastClose <= lastOpen) {
+      const tail = text.slice(lastOpen);
+      if (tail.length <= 4096) {
+        return { safe: text.slice(0, lastOpen), remainder: tail };
+      }
+    }
+  }
+
+  const lookbehind = 8;
+  if (text.length <= lookbehind) return { safe: '', remainder: text };
+  return { safe: text.slice(0, -lookbehind), remainder: text.slice(-lookbehind) };
+}
+
+class LocalFileLinkFilter {
+  constructor() {
+    this.buffer = '';
+  }
+
+  filter(delta) {
+    if (!delta) return '';
+    this.buffer += delta;
+    return this._drain(false);
+  }
+
+  flush() {
+    if (!this.buffer) return '';
+    return this._drain(true);
+  }
+
+  _drain(flushAll) {
+    if (flushAll) {
+      const output = rewriteLocalFileLinks(this.buffer);
+      this.buffer = '';
+      return output;
+    }
+
+    const { safe, remainder } = splitTrailingPartialMarkdownLink(this.buffer);
+    this.buffer = remainder;
+    return rewriteLocalFileLinks(safe);
+  }
+}
+
 function formatDisplayBlock(title, body = '', language = '') {
   const normalized = trimBoundaryNewlines(body);
-  const label = formatInlineLabel(title);
-  if (!label) return '';
-  if (!normalized) return `\n\n${label}\n\n`;
-  return `\n\n${label}\n\n${formatCodeBlock(normalized, language)}\n\n`;
+  const summary = normalizeDisplayLabel(title);
+  const prefixedSummary = summary ? `- ${summary}` : '';
+  if (!summary) return '';
+  if (!normalized) return `\n\n${formatInlineLabel(prefixedSummary)}\n\n`;
+  return `\n\n<details>\n<summary>${escapeHtml(prefixedSummary)}</summary>\n\n${formatCodeBlock(normalized, language)}\n\n</details>\n\n`;
 }
 
 async function handleChatCompletion(json, req, res) {
@@ -366,6 +515,7 @@ async function handleChatCompletion(json, req, res) {
     let stderrBuffer = '';
     let sentVisibleContent = false;
     let clientDisconnected = false;
+    const contentLinkFilter = new LocalFileLinkFilter();
 
     // Client disconnect → kill child process to save tokens
     // Note: req 'close' fires on normal completion too, so check proc.exitCode
@@ -381,8 +531,12 @@ async function handleChatCompletion(json, req, res) {
 
     function sendChunk(field, text) {
       if (!text || res.writableEnded) return;
+      const rewritten = field === 'content'
+        ? contentLinkFilter.filter(text)
+        : text;
+      if (!rewritten || res.writableEnded) return;
       sentVisibleContent = true;
-      const delta = { [field]: text };
+      const delta = { [field]: rewritten };
       if (!sentRole) { delta.role = 'assistant'; sentRole = true; }
       res.write(`data: ${JSON.stringify({
         id: chatId, object: 'chat.completion.chunk',
@@ -507,6 +661,18 @@ async function handleChatCompletion(json, req, res) {
       cleanupTempFiles();
       if (res.writableEnded) return;
 
+      const trailingLinkChunk = contentLinkFilter.flush();
+      if (trailingLinkChunk) {
+        sentVisibleContent = true;
+        const delta = { content: trailingLinkChunk };
+        if (!sentRole) { delta.role = 'assistant'; sentRole = true; }
+        res.write(`data: ${JSON.stringify({
+          id: chatId, object: 'chat.completion.chunk',
+          created: Math.floor(Date.now() / 1000), model,
+          choices: [{ index: 0, delta, finish_reason: null }],
+        })}\n\n`);
+      }
+
       const stderrMessage = stderrBuffer.trim();
       if (!clientDisconnected && code !== 0 && !sentVisibleContent) {
         const message = stderrMessage || `Claude exited with code ${code}${signal ? ` (${signal})` : ''}`;
@@ -583,7 +749,7 @@ async function handleChatCompletion(json, req, res) {
       model,
       choices: [{
         index: 0,
-        message: { role: 'assistant', content: stdout.trim() },
+        message: { role: 'assistant', content: rewriteLocalFileLinks(stdout.trim()) },
         finish_reason: 'stop',
       }],
       usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },

@@ -5,3 +5,4 @@ qdrant/data/
 __pycache__/
 *.pyc
 nginx/ssl/*.pem
+llm-proxy/.local-file-signing.key
