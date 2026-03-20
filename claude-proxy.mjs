@@ -385,9 +385,15 @@ function splitTrailingPartialMarkdownLink(text) {
     }
   }
 
-  const lookbehind = 8;
-  if (text.length <= lookbehind) return { safe: '', remainder: text };
-  return { safe: text.slice(0, -lookbehind), remainder: text.slice(-lookbehind) };
+  const trailingLinkLabel = text.match(/\[[^\]\n]{0,256}\]$/);
+  if (trailingLinkLabel && trailingLinkLabel.index != null) {
+    return {
+      safe: text.slice(0, trailingLinkLabel.index),
+      remainder: text.slice(trailingLinkLabel.index),
+    };
+  }
+
+  return { safe: text, remainder: '' };
 }
 
 class LocalFileLinkFilter {
