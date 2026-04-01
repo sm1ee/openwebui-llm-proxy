@@ -26,6 +26,9 @@ If you want the convenience of OpenWebUI with the power of CLI-based coding agen
 - **Runtime display controls**
   Turn thinking, reasoning, tool headers, and tool bodies on or off without editing code.
 
+- **Fast auxiliary chat tasks**
+  Keep the main answer on Claude or Codex, while routing title generation, chat tags, and follow-up suggestions to a lighter model.
+
 - **Signed local file viewer**
   Model outputs can link to local workspace files through signed same-origin URLs, with:
   - line anchors
@@ -127,11 +130,26 @@ LOCAL_FILE_URL_PREFIX=/absolute/path/to/your/openclaw/workspace
 LOCAL_FILE_VIEWER_BASE_URL=https://ai.yourdomain.com
 ```
 
+Useful optional task-routing values:
+
+```bash
+# Keep OpenWebUI chat UX helpers enabled
+ENABLE_TITLE_GENERATION=true
+ENABLE_TAGS_GENERATION=true
+ENABLE_FOLLOW_UP_GENERATION=true
+
+# Route title / tag / follow-up generation to a faster external model
+CHAT_AUX_TASK_MODEL_EXTERNAL=gpt-5.4-mini
+```
+
 ### 2. Start Docker services
 
 ```bash
 docker compose up -d --build
 ```
+
+The bundled compose file pins OpenWebUI to `v0.8.12` instead of floating on `main`,
+so upgrades are explicit and reproducible.
 
 This starts:
 
@@ -231,6 +249,11 @@ That viewer supports:
 - one-click copy
 - same-origin browser opening instead of dead `/Users/...` links
 
+Supported link styles:
+
+- absolute workspace paths such as `/absolute/path/to/workspace/project/report.md`
+- eligible relative workspace references such as `project/report.md` when they resolve uniquely inside the mounted workspace
+
 By default the viewer also supports direct authenticated browsing when enabled behind OpenWebUI, and signed links have a TTL.
 
 Relevant settings:
@@ -288,6 +311,29 @@ Write tools:
 
 Collections are created automatically when needed.
 
+### 5. Chat task routing and toggles
+
+OpenWebUI normally generates a few chat UX helpers after the main assistant reply:
+
+- chat title
+- chat tags
+- follow-up suggestions
+
+This repo exposes simple environment toggles for those helpers:
+
+| Variable | Description |
+|---|---|
+| `ENABLE_TITLE_GENERATION` | Enable or disable automatic chat titles |
+| `ENABLE_TAGS_GENERATION` | Enable or disable automatic tag generation |
+| `ENABLE_FOLLOW_UP_GENERATION` | Enable or disable follow-up suggestions |
+| `CHAT_AUX_TASK_MODEL` | Preferred lightweight local model for those helpers |
+| `CHAT_AUX_TASK_MODEL_EXTERNAL` | Preferred lightweight external model for those helpers |
+
+Recommended pattern:
+
+- keep your main chat on a stronger model such as Claude Opus
+- send title / tag / follow-up generation to a cheaper and faster model such as `gpt-5.4-mini`
+
 ## OpenWebUI Runtime Patches
 
 This repo includes runtime patches to make OpenWebUI behave better for coding-agent usage.
@@ -297,6 +343,7 @@ Current patch areas include:
 - better handling of code-interpreter output
 - preserving assistant text after code execution blocks
 - same-origin `/local-file/*` pass-through routing
+- routing title / tag / follow-up generation to a separate model
 
 Files:
 
@@ -364,6 +411,7 @@ See:
 - supports thinking output in OpenWebUI
 - keeps long-running streams alive
 - rewrites eligible local-file markdown links into signed viewer links
+- supports signed links for both absolute workspace paths and uniquely resolvable relative file references
 - can hide tool bodies while still showing compact tool headers
 
 ## Files to care about first
