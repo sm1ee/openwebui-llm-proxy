@@ -142,6 +142,11 @@ from open_webui.constants import TASKS
 logging.basicConfig(stream=sys.stdout, level=GLOBAL_LOG_LEVEL)
 log = logging.getLogger(__name__)
 
+CHAT_AUX_TASK_MODEL = os.environ.get("CHAT_AUX_TASK_MODEL", "").strip()
+CHAT_AUX_TASK_MODEL_EXTERNAL = os.environ.get(
+    "CHAT_AUX_TASK_MODEL_EXTERNAL", ""
+).strip()
+
 
 DEFAULT_REASONING_TAGS = [
     ("<think>", "</think>"),
@@ -160,6 +165,25 @@ DEFAULT_CODE_INTERPRETER_TAGS = [("<code_interpreter>", "</code_interpreter>")]
 def output_id(prefix: str) -> str:
     """Generate OR-style ID: prefix + 24-char hex UUID."""
     return f"{prefix}_{uuid4().hex[:24]}"
+
+
+def get_chat_aux_task_model_id(default_model_id: str, models: dict) -> str:
+    """
+    Pick a lightweight model for chat UX side-tasks such as title/tag/follow-up
+    generation without affecting the main assistant response model.
+    """
+    if not CHAT_AUX_TASK_MODEL and not CHAT_AUX_TASK_MODEL_EXTERNAL:
+        return default_model_id
+
+    try:
+        return get_task_model_id(
+            default_model_id,
+            CHAT_AUX_TASK_MODEL,
+            CHAT_AUX_TASK_MODEL_EXTERNAL,
+            models,
+        )
+    except Exception:
+        return default_model_id
 
 
 def _split_tool_calls(
@@ -2940,6 +2964,7 @@ async def background_tasks_handler(ctx):
 
     if message and "model" in message:
         if tasks and messages:
+            aux_task_model_id = get_chat_aux_task_model_id(message["model"], models)
             if (
                 TASKS.FOLLOW_UP_GENERATION in tasks
                 and tasks[TASKS.FOLLOW_UP_GENERATION]
@@ -2947,7 +2972,7 @@ async def background_tasks_handler(ctx):
                 res = await generate_follow_ups(
                     request,
                     {
-                        "model": message["model"],
+                        "model": aux_task_model_id,
                         "messages": messages,
                         "message_id": metadata["message_id"],
                         "chat_id": metadata["chat_id"],
@@ -3005,7 +3030,7 @@ async def background_tasks_handler(ctx):
                         res = await generate_title(
                             request,
                             {
-                                "model": message["model"],
+                                "model": aux_task_model_id,
                                 "messages": messages,
                                 "chat_id": metadata["chat_id"],
                             },
@@ -3067,7 +3092,7 @@ async def background_tasks_handler(ctx):
                     res = await generate_chat_tags(
                         request,
                         {
-                            "model": message["model"],
+                            "model": aux_task_model_id,
                             "messages": messages,
                             "chat_id": metadata["chat_id"],
                         },

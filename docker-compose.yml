@@ -56,6 +56,7 @@ services:
       LOCAL_FILE_MOUNT_ROOT: "/workspace-host"
       LOCAL_FILE_SIGNING_KEY_FILE: "/llm-proxy/.local-file-signing.key"
       LOCAL_FILE_REQUIRE_ADMIN: "${LOCAL_FILE_REQUIRE_ADMIN:-true}"
+      LOCAL_FILE_SHOW_TITLE: "${LOCAL_FILE_SHOW_TITLE:-false}"
       LOCAL_FILE_MAX_INLINE_BYTES: "${LOCAL_FILE_MAX_INLINE_BYTES:-1048576}"
       LOCAL_FILE_AUTH_TIMEOUT_SECONDS: "${LOCAL_FILE_AUTH_TIMEOUT_SECONDS:-5}"
       LOCAL_FILE_LINK_TTL_SECONDS: "${LOCAL_FILE_LINK_TTL_SECONDS:-2592000}"
@@ -67,7 +68,7 @@ services:
 
   # ── OpenWebUI ──
   open-webui:
-    image: ghcr.io/open-webui/open-webui:main
+    image: ghcr.io/open-webui/open-webui:v0.8.12
     container_name: open-webui
     restart: unless-stopped
     ports:
@@ -77,18 +78,26 @@ services:
       ENABLE_SIGNUP: "true"
       LOCAL_FILE_VIEWER_INTERNAL_URL: "http://local-file-viewer:8000"
       LOCAL_FILE_PROXY_TIMEOUT_SECONDS: "30"
+      ENABLE_TITLE_GENERATION: "${ENABLE_TITLE_GENERATION:-true}"
+      ENABLE_TAGS_GENERATION: "${ENABLE_TAGS_GENERATION:-true}"
+      ENABLE_FOLLOW_UP_GENERATION: "${ENABLE_FOLLOW_UP_GENERATION:-true}"
+      CHAT_AUX_TASK_MODEL: "${CHAT_AUX_TASK_MODEL:-}"
+      CHAT_AUX_TASK_MODEL_EXTERNAL: "${CHAT_AUX_TASK_MODEL_EXTERNAL:-gpt-5.4-mini}"
       # Codex proxy (맥 로컬 :8200)
       OPENAI_API_BASE_URLS: "http://host.docker.internal:8200/v1;http://host.docker.internal:8201/v1"
       OPENAI_API_KEYS: "dummy-codex;dummy-claude"
       CODE_INTERPRETER_PROMPT_TEMPLATE: |-
         #### Code Interpreter
 
-        You have access to a Python code interpreter via: `<code_interpreter type="code" lang="python"></code_interpreter>`
+        You have access to a Python code interpreter via: `<code_interpreter></code_interpreter>`
 
         - When you need Python execution, put only executable Python code inside the XML tags so the tool can run it.
         - Do NOT use triple backticks inside the XML tags.
         - Always print meaningful outputs.
-        - After the interpreter output, continue with a normal chat response outside the XML tags and do not end the user-facing answer as only a code block.
+        - Outside the XML tags, write only normal prose.
+        - Do NOT output raw Python, raw XML tags, or pseudo-code outside the XML tags.
+        - If you need to show code outside the interpreter block, use fenced markdown code blocks.
+        - After the interpreter output, continue with a normal chat response outside the XML tags.
     volumes:
       - open-webui-data:/app/backend/data
       - ./open-webui-runtime-patches/main.py:/app/backend/open_webui/main.py:ro

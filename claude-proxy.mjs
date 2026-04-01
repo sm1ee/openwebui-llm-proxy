@@ -42,6 +42,16 @@ function loadLocalFileSigningKey() {
 }
 
 const LOCAL_FILE_SIGNING_KEY = loadLocalFileSigningKey();
+const RELATIVE_LOCAL_FILE_CACHE = new Map();
+const RELATIVE_LOCAL_FILE_BASE_DIRS = Array.from(new Set(
+  [
+    '',
+    path.relative(LOCAL_FILE_PATH_PREFIX, __dirname),
+    path.relative(LOCAL_FILE_PATH_PREFIX, path.join(__dirname, '..')),
+  ]
+    .map((value) => String(value || '').replace(/\\/g, '/').replace(/^\/+|\/+$/g, ''))
+    .filter((value, index, values) => values.indexOf(value) === index)
+));
 
 // ── Config ──
 const DEFAULT_CONFIG = {
@@ -203,7 +213,7 @@ function saveBase64Image(dataUrl) {
   }
 }
 
-function buildPrompt(messages) {
+function buildPrompt(messages, cfg = {}) {
   // system 메시지 분리 — --system-prompt 플래그로 전달
   const parts = [];
   const tempFiles = [];
@@ -236,7 +246,14 @@ function buildPrompt(messages) {
       }
       content = contentParts.join('\n');
     }
-    if (m.role === 'assistant') parts.push(`[Assistant] ${content}`);
+    if (m.role === 'assistant') {
+      const sanitized = sanitizeAssistantText(content, {
+        toolDisplay: false,
+        toolBodyDisplay: false,
+        forHistory: true,
+      });
+      parts.push(`[Assistant] ${sanitized}`);
+    }
     else parts.push(content);
   }
   return { prompt: parts.join('\n\n'), tempFiles };
@@ -310,28 +327,216 @@ function escapeHtml(text) {
     .replace(/>/g, '&gt;');
 }
 
+function escapeRegExp(text) {
+  return String(text || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function normalizeWorkspaceRelativePath(value) {
+  const normalized = String(value || '')
+    .replace(/\\/g, '/')
+    .replace(/^\.\/+/, '')
+    .replace(/^\/+/, '')
+    .trim();
+
+  if (!normalized) return '';
+  if (normalized.includes('..')) return '';
+  return normalized;
+}
+
+function resolveWorkspaceRelativeFile(relativePath) {
+  const normalized = normalizeWorkspaceRelativePath(relativePath);
+  if (!normalized) return '';
+
+  const candidate = path.resolve(LOCAL_FILE_PATH_PREFIX, normalized);
+  const workspaceRelative = path.relative(LOCAL_FILE_PATH_PREFIX, candidate);
+  if (!workspaceRelative || workspaceRelative.startsWith('..') || path.isAbsolute(workspaceRelative)) {
+    return '';
+  }
+
+  try {
+    const stat = fs.statSync(candidate);
+    if (!stat.isFile()) return '';
+    return workspaceRelative.replace(/\\/g, '/');
+  } catch {
+    return '';
+  }
+}
+
+function findRelativeLocalFileTarget(relativePath) {
+  const normalized = normalizeWorkspaceRelativePath(relativePath);
+  if (!normalized) return '';
+  if (RELATIVE_LOCAL_FILE_CACHE.has(normalized)) {
+    return RELATIVE_LOCAL_FILE_CACHE.get(normalized) || '';
+  }
+
+  for (const baseDir of RELATIVE_LOCAL_FILE_BASE_DIRS) {
+    const withBase = normalizeWorkspaceRelativePath(
+      baseDir ? path.posix.join(baseDir, normalized) : normalized
+    );
+    const resolved = resolveWorkspaceRelativeFile(withBase);
+    if (resolved) {
+      RELATIVE_LOCAL_FILE_CACHE.set(normalized, resolved);
+      return resolved;
+    }
+  }
+
+  try {
+    const stdout = execFileSync(
+      'rg',
+      ['--files', LOCAL_FILE_PATH_PREFIX, '-g', `**/${normalized}`],
+      { encoding: 'utf8', maxBuffer: 1024 * 1024 }
+    );
+    const matches = Array.from(new Set(
+      stdout
+        .split('\n')
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .map((line) => path.relative(LOCAL_FILE_PATH_PREFIX, line).replace(/\\/g, '/'))
+    ));
+
+    if (matches.length === 1) {
+      RELATIVE_LOCAL_FILE_CACHE.set(normalized, matches[0]);
+      return matches[0];
+    }
+  } catch (error) {
+    if (error?.status !== 1 && error?.code !== 'ENOENT') {
+      console.error(`[claude] relative local-file lookup failed for "${normalized}": ${error.message}`);
+    }
+  }
+
+  RELATIVE_LOCAL_FILE_CACHE.set(normalized, '');
+  return '';
+}
+
+function unwrapCodeInterpreterOutput(text) {
+  const raw = String(text || '');
+  const outputMatch = raw.match(/<output\b[^>]*>([\s\S]*?)<\/output\s*>/i);
+  return trimBoundaryNewlines(outputMatch ? outputMatch[1] : raw);
+}
+
+function renderCodeInterpreterResultBlock(body, options = {}) {
+  const cfg = options || {};
+  const normalized = unwrapCodeInterpreterOutput(body);
+  if (!normalized) return '';
+  if (cfg.forHistory || cfg.toolDisplay === false) return '';
+  if (cfg.toolBodyDisplay === true) return formatDisplayBlock('[result]', normalized);
+  return formatDisplayBlock('[result]', '');
+}
+
+function sanitizeAssistantText(text, options = {}) {
+  let output = String(text || '');
+
+  output = output.replace(
+    /<code_interpreter_result\b[^>]*>([\s\S]*?)<\/code_interpreter_result\s*>/gi,
+    (_, body) => renderCodeInterpreterResultBlock(body, options)
+  );
+
+  output = output
+    .replace(/<\/?output\b[^>]*>/gi, '')
+    .replace(/<\/?code_interpreter_result\b[^>]*>/gi, '')
+    .replace(/\n{3,}/g, '\n\n');
+
+  return trimBoundaryNewlines(output);
+}
+
+class CodeInterpreterResultFilter {
+  constructor(options = {}) {
+    this.buffer = '';
+    this.options = options;
+  }
+
+  filter(delta) {
+    if (!delta) return '';
+    this.buffer += delta;
+    return this._drain(false);
+  }
+
+  flush() {
+    if (!this.buffer) return '';
+    return this._drain(true);
+  }
+
+  _drain(flushAll) {
+    let output = '';
+    const openRe = /<code_interpreter_result\b[^>]*>/i;
+    const closeRe = /<\/code_interpreter_result\s*>/i;
+
+    while (this.buffer) {
+      const openMatch = this.buffer.match(openRe);
+      if (!openMatch) {
+        if (flushAll) {
+          output += sanitizeAssistantText(this.buffer, this.options);
+          this.buffer = '';
+        } else {
+          const { safe, remainder } = splitTrailingPartialTag(this.buffer);
+          output += sanitizeAssistantText(safe, this.options);
+          this.buffer = remainder;
+        }
+        break;
+      }
+
+      const start = openMatch.index ?? 0;
+      if (start > 0) {
+        output += sanitizeAssistantText(this.buffer.slice(0, start), this.options);
+        this.buffer = this.buffer.slice(start);
+        continue;
+      }
+
+      const openEnd = this.buffer.indexOf('>');
+      if (openEnd === -1) break;
+
+      const afterOpen = this.buffer.slice(openEnd + 1);
+      const closeMatch = afterOpen.match(closeRe);
+      if (!closeMatch || typeof closeMatch.index !== 'number') break;
+
+      const body = afterOpen.slice(0, closeMatch.index);
+      output += renderCodeInterpreterResultBlock(body, this.options);
+      this.buffer = afterOpen.slice(closeMatch.index + closeMatch[0].length);
+    }
+
+    return output;
+  }
+}
+
 function parseLocalFileTarget(href) {
   const raw = String(href || '').trim();
   if (!raw) return null;
   if (raw.includes('/local-file/t/')) return null;
 
-  const extract = (value, hash = '') => {
+  const extractAbsolute = (value, hash = '') => {
     if (!value.startsWith(LOCAL_FILE_PATH_PREFIX)) return null;
     const relativePath = decodeURIComponent(value.slice(LOCAL_FILE_PATH_PREFIX.length).replace(/^\/+/, ''));
     if (!relativePath) return null;
     return { relativePath, hash };
   };
 
+  const extractRelative = (value, hash = '') => {
+    const normalized = normalizeWorkspaceRelativePath(decodeURIComponent(String(value || '')));
+
+    if (!normalized) return null;
+    if (!normalized.includes('/')) return null;
+    if (normalized.includes('..')) return null;
+    if (normalized.startsWith('local-file/')) return null;
+    if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(normalized)) return null;
+    if (!/\.[A-Za-z0-9._-]+$/.test(normalized)) return null;
+
+    const resolved = findRelativeLocalFileTarget(normalized);
+    if (!resolved) return null;
+
+    return { relativePath: resolved, hash };
+  };
+
   if (raw.startsWith(LOCAL_FILE_PATH_PREFIX)) {
     const [pathname, hash = ''] = raw.split('#', 2);
-    return extract(pathname, hash ? `#${hash}` : '');
+    return extractAbsolute(pathname, hash ? `#${hash}` : '');
   }
 
   try {
     const parsed = new URL(raw);
-    return extract(parsed.pathname, parsed.hash || '');
+    return extractAbsolute(parsed.pathname, parsed.hash || '');
   } catch {
-    return null;
+    const [pathname, hash = ''] = raw.split('#', 2);
+    return extractRelative(pathname, hash ? `#${hash}` : '');
   }
 }
 
@@ -362,12 +567,27 @@ function normalizeLocalFileHref(href) {
 
 function rewriteLocalFileLinks(text) {
   const input = String(text || '');
-  if (!input || !input.includes(LOCAL_FILE_PATH_PREFIX)) return input;
+  if (!input) return input;
 
-  return input.replace(/\]\(([^)\s]+)\)/g, (match, href) => {
+  let output = input.replace(/\]\(([^)\s]+)\)/g, (match, href) => {
     const rewritten = normalizeLocalFileHref(href);
     return rewritten ? `](${rewritten})` : match;
   });
+
+  const rawUrlRe = new RegExp(
+    `https?:\\/\\/[^\\s<>()]*${escapeRegExp(LOCAL_FILE_PATH_PREFIX)}[^\\s<>()]*`,
+    'g'
+  );
+  output = output.replace(rawUrlRe, (href) => normalizeLocalFileHref(href) || href);
+
+  const rawRelativePathRe = /(^|[\s>:(])((?:\.\/)?(?:[A-Za-z0-9._-]+\/)+[A-Za-z0-9._-]+\.[A-Za-z0-9._-]+(?:#[^\s<>()]+)?)/g;
+  output = output.replace(rawRelativePathRe, (match, prefix, candidate) => {
+    const rewritten = normalizeLocalFileHref(candidate);
+    if (!rewritten) return match;
+    return `${prefix}[${candidate}](${rewritten})`;
+  });
+
+  return output;
 }
 
 function splitTrailingPartialMarkdownLink(text) {
@@ -390,6 +610,14 @@ function splitTrailingPartialMarkdownLink(text) {
     return {
       safe: text.slice(0, trailingLinkLabel.index),
       remainder: text.slice(trailingLinkLabel.index),
+    };
+  }
+
+  const trailingPathFragment = text.match(/((?:\.\/)?(?:[A-Za-z0-9._-]+\/)+[A-Za-z0-9._-]*)$/);
+  if (trailingPathFragment?.index != null) {
+    return {
+      safe: text.slice(0, trailingPathFragment.index),
+      remainder: text.slice(trailingPathFragment.index),
     };
   }
 
@@ -431,7 +659,7 @@ function formatDisplayBlock(title, body = '', language = '') {
   const prefixedSummary = summary ? `- ${summary}` : '';
   if (!summary) return '';
   if (!normalized) return `\n\n${formatInlineLabel(prefixedSummary)}\n\n`;
-  return `\n\n<details>\n<summary>${escapeHtml(prefixedSummary)}</summary>\n\n${formatCodeBlock(normalized, language)}\n\n</details>\n\n`;
+  return `\n\n<details open>\n<summary>${escapeHtml(prefixedSummary)}</summary>\n\n${formatCodeBlock(normalized, language)}\n\n</details>\n\n`;
 }
 
 async function handleChatCompletion(json, req, res) {
@@ -456,7 +684,7 @@ async function handleChatCompletion(json, req, res) {
     }
   }
 
-  const { prompt, tempFiles } = buildPrompt(messages);
+  const { prompt, tempFiles } = buildPrompt(messages, cfg);
   const systemPrompt = extractSystemPrompt(messages);
   const chatId = `chatcmpl-${randomUUID().slice(0, 8)}`;
 
@@ -521,6 +749,7 @@ async function handleChatCompletion(json, req, res) {
     let stderrBuffer = '';
     let sentVisibleContent = false;
     let clientDisconnected = false;
+    const resultFilter = new CodeInterpreterResultFilter(cfg);
     const contentLinkFilter = new LocalFileLinkFilter();
 
     // Client disconnect → kill child process to save tokens
@@ -537,9 +766,11 @@ async function handleChatCompletion(json, req, res) {
 
     function sendChunk(field, text) {
       if (!text || res.writableEnded) return;
-      const rewritten = field === 'content'
-        ? contentLinkFilter.filter(text)
-        : text;
+      let rewritten = text;
+      if (field === 'content') {
+        rewritten = resultFilter.filter(rewritten);
+        rewritten = contentLinkFilter.filter(rewritten);
+      }
       if (!rewritten || res.writableEnded) return;
       sentVisibleContent = true;
       const delta = { [field]: rewritten };
@@ -667,7 +898,9 @@ async function handleChatCompletion(json, req, res) {
       cleanupTempFiles();
       if (res.writableEnded) return;
 
-      const trailingLinkChunk = contentLinkFilter.flush();
+      const trailingResultChunk = resultFilter.flush();
+      const trailingFromResult = trailingResultChunk ? contentLinkFilter.filter(trailingResultChunk) : '';
+      const trailingLinkChunk = `${trailingFromResult}${contentLinkFilter.flush()}`;
       if (trailingLinkChunk) {
         sentVisibleContent = true;
         const delta = { content: trailingLinkChunk };
@@ -755,7 +988,10 @@ async function handleChatCompletion(json, req, res) {
       model,
       choices: [{
         index: 0,
-        message: { role: 'assistant', content: rewriteLocalFileLinks(stdout.trim()) },
+        message: {
+          role: 'assistant',
+          content: rewriteLocalFileLinks(sanitizeAssistantText(stdout.trim(), cfg)),
+        },
         finish_reason: 'stop',
       }],
       usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
