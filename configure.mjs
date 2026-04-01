@@ -14,6 +14,7 @@ const DEFAULTS = {
     toolBodyDisplay: false,
     debugLog: false,
     effort: 'high',
+    remoteControl: false,
   },
   codex: {
     reasoning: true,
@@ -25,15 +26,15 @@ const DEFAULTS = {
 
 const PRESETS = {
   fast: {
-    claude: { thinking: false, toolDisplay: false, toolBodyDisplay: false, debugLog: false },
+    claude: { thinking: false, toolDisplay: false, toolBodyDisplay: false, debugLog: false, remoteControl: false },
     codex: { reasoning: false, toolDisplay: false, toolBodyDisplay: false },
   },
   balanced: {
-    claude: { thinking: false, toolDisplay: true, toolBodyDisplay: false, debugLog: false },
+    claude: { thinking: false, toolDisplay: true, toolBodyDisplay: false, debugLog: false, remoteControl: false },
     codex: { reasoning: false, toolDisplay: true, toolBodyDisplay: false },
   },
   verbose: {
-    claude: { thinking: true, toolDisplay: true, toolBodyDisplay: true, debugLog: false },
+    claude: { thinking: true, toolDisplay: true, toolBodyDisplay: true, debugLog: false, remoteControl: false },
     codex: { reasoning: true, toolDisplay: true, toolBodyDisplay: true },
   },
 };
@@ -44,6 +45,7 @@ const SETTERS = {
   'claude.toolBodyDisplay': 'boolean',
   'claude.debugLog': 'boolean',
   'claude.effort': ['low', 'medium', 'high'],
+  'claude.remoteControl': 'boolean',
   'codex.reasoning': 'boolean',
   'codex.toolDisplay': 'boolean',
   'codex.toolBodyDisplay': 'boolean',
@@ -108,6 +110,7 @@ function usage(code = 0) {
     'Examples:',
     '  node configure.mjs fast',
     '  node configure.mjs set claude.thinking off',
+    '  node configure.mjs set claude.remoteControl on',
     '  node configure.mjs set codex.toolDisplay on',
     '  node configure.mjs set codex.toolBodyDisplay off',
     '  node configure.mjs set claude.effort medium',

@@ -61,6 +61,7 @@ const DEFAULT_CONFIG = {
     toolBodyDisplay: false,
     debugLog: false,
     effort: 'high',
+    remoteControl: false,
   },
 };
 
@@ -102,6 +103,34 @@ const MODELS = [
 ];
 
 const activeChildPids = new Set();
+let claudeHelpTextCache;
+const warnedUnsupportedClaudeOptions = new Set();
+
+function getClaudeHelpText() {
+  if (typeof claudeHelpTextCache === 'string') return claudeHelpTextCache;
+  try {
+    claudeHelpTextCache = execFileSync(CLAUDE_BIN, ['--help'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+  } catch (error) {
+    const stdout = error?.stdout ? String(error.stdout) : '';
+    const stderr = error?.stderr ? String(error.stderr) : '';
+    claudeHelpTextCache = `${stdout}\n${stderr}`;
+  }
+  return claudeHelpTextCache || '';
+}
+
+function claudeSupportsOption(optionName) {
+  const help = getClaudeHelpText();
+  return help.includes(optionName);
+}
+
+function warnUnsupportedClaudeOptionOnce(optionName) {
+  if (warnedUnsupportedClaudeOptions.has(optionName)) return;
+  warnedUnsupportedClaudeOptions.add(optionName);
+  console.warn(`[claude] configured option ${optionName} is not supported by the installed Claude CLI. Ignoring it.`);
+}
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -690,6 +719,13 @@ async function handleChatCompletion(json, req, res) {
 
   const effort = cfg.effort || 'high';
   const args = ['-p', '--model', model, '--no-session-persistence', '--effort', effort];
+  if (cfg.remoteControl) {
+    if (claudeSupportsOption('--remote-control')) {
+      args.push('--remote-control');
+    } else {
+      warnUnsupportedClaudeOptionOnce('--remote-control');
+    }
+  }
   if (systemPrompt) {
     args.push('--system-prompt', systemPrompt);
   }
