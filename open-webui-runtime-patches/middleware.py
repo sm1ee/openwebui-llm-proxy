@@ -2916,6 +2916,13 @@ async def background_tasks_handler(ctx):
     tasks = ctx["tasks"]
     event_emitter = ctx["event_emitter"]
 
+    if getattr(request.state, "direct", False) and hasattr(request.state, "model"):
+        models = {
+            request.state.model["id"]: request.state.model,
+        }
+    else:
+        models = request.app.state.MODELS
+
     message = None
     messages = []
 
